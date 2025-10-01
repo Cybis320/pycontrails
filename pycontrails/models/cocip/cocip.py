@@ -421,6 +421,11 @@ class Cocip(Model):
         """
 
         self.update_params(params)
+
+        # Handle parallel processing if enabled
+        if self.params.get("parallel", False) and isinstance(source, Sequence):
+            return self.eval_parallel(list(source), **params)
+
         self.set_source(source)
         self.source = self.require_source_type(Flight)
         return_flight_list = isinstance(self.source, Fleet) and isinstance(source, Sequence)

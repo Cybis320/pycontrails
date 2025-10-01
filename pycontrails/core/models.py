@@ -122,6 +122,28 @@ class ModelParams:
         np.timedelta64(0, "h"),
     )
 
+    # ---------------
+    # Parallel processing
+    # ---------------
+
+    #: Enable parallel processing when source is a Sequence[Flight].
+    #: If True, flights will be split into chunks and processed in parallel.
+    #: Each chunk is converted to a Fleet to minimize memory usage per worker.
+    #: .. versionadded:: 0.54.12
+    parallel: bool = False
+
+    #: Number of parallel workers to use. If -1, use all available CPU cores.
+    #: Only applies when :attr:`parallel` is True.
+    #: .. versionadded:: 0.54.12
+    n_jobs: int = -1
+
+    #: Number of flights per chunk for parallel processing.
+    #: If None, flights are split evenly across workers.
+    #: Smaller chunks reduce memory per worker but increase overhead.
+    #: Only applies when :attr:`parallel` is True.
+    #: .. versionadded:: 0.54.12
+    parallel_chunk_size: int | None = None
+
     def as_dict(self) -> dict[str, Any]:
         """Convert object to dictionary.
 
@@ -485,9 +507,9 @@ class Model(ABC):
     def _get_source(self, source: GeoVectorDataset) -> GeoVectorDataset: ...
 
     @overload
-    def _get_source(self, source: Sequence[Flight]) -> Fleet: ...
+    def _get_source(self, source: Sequence[Flight]) -> Fleet | list[Flight]: ...
 
-    def _get_source(self, source: ModelInput) -> SourceType:
+    def _get_source(self, source: ModelInput) -> SourceType | list[Flight]:
         """Construct :attr:`source` from ``source`` parameter."""
 
         # Fallback to met coordinates if source is None
@@ -499,11 +521,16 @@ class Model(ABC):
 
         copy_source = self.params["copy_source"]
 
-        # Turn Sequence into Fleet
+        # Turn Sequence into Fleet (or keep as list for parallel processing)
         if isinstance(source, Sequence):
             if not copy_source:
                 msg = "Parameter copy_source=False is not supported for Sequence[Flight] source"
                 raise ValueError(msg)
+
+            # If parallel processing is enabled, keep as list for chunking
+            if self.params.get("parallel", False):
+                return list(source)
+
             return Fleet.from_seq(source)
 
         # Raise error if source is not a MetDataset or GeoVectorDataset
@@ -531,6 +558,126 @@ class Model(ABC):
                 source["flight_id"] = np.zeros(len(source), dtype=int)
 
         return source
+
+    def _split_flights_into_chunks(
+        self, flights: Sequence[Flight]
+    ) -> list[list[Flight]]:
+        """Split flights into chunks for parallel processing.
+
+        Parameters
+        ----------
+        flights : Sequence[Flight]
+            List of flights to split
+
+        Returns
+        -------
+        list[list[Flight]]
+            List of flight chunks
+        """
+        n_flights = len(flights)
+        chunk_size = self.params["parallel_chunk_size"]
+        n_jobs = self.params["n_jobs"]
+
+        if chunk_size is not None:
+            # Split by chunk size
+            chunks = [
+                list(flights[i : i + chunk_size])
+                for i in range(0, n_flights, chunk_size)
+            ]
+        else:
+            # Split evenly across workers
+            import os
+            if n_jobs == -1:
+                n_jobs = os.cpu_count() or 1
+
+            chunk_size = max(1, n_flights // n_jobs)
+            chunks = [
+                list(flights[i : i + chunk_size])
+                for i in range(0, n_flights, chunk_size)
+            ]
+
+        return chunks
+
+    def _eval_chunk(
+        self, chunk: list[Flight], **params: Any
+    ) -> Fleet:
+        """Evaluate a chunk of flights.
+
+        This method is called by parallel workers. It converts the chunk
+        to a Fleet and calls eval.
+
+        Parameters
+        ----------
+        chunk : list[Flight]
+            Chunk of flights to process
+        **params : Any
+            Model parameters
+
+        Returns
+        -------
+        Fleet
+            Evaluated fleet
+        """
+        # Convert chunk to Fleet
+        fleet = Fleet.from_seq(chunk)
+        # Temporarily disable parallel to avoid nested parallelism
+        original_parallel = self.params.get("parallel", False)
+        self.params["parallel"] = False
+        try:
+            result = self.eval(fleet, **params)
+        finally:
+            self.params["parallel"] = original_parallel
+        return result  # type: ignore[return-value]
+
+    def eval_parallel(
+        self, flights: list[Flight], **params: Any
+    ) -> list[Flight]:
+        """Evaluate flights in parallel using chunked Fleet processing.
+
+        This method splits flights into chunks, processes each chunk as a Fleet
+        in parallel, and returns the combined results.
+
+        Parameters
+        ----------
+        flights : list[Flight]
+            List of flights to process
+        **params : Any
+            Model parameters
+
+        Returns
+        -------
+        list[Flight]
+            List of processed flights
+
+        Raises
+        ------
+        ImportError
+            If joblib is not installed
+        """
+        try:
+            from joblib import Parallel, delayed
+        except ImportError as e:
+            msg = (
+                "joblib is required for parallel processing. "
+                "Install it with: pip install joblib"
+            )
+            raise ImportError(msg) from e
+
+        # Split flights into chunks
+        chunks = self._split_flights_into_chunks(flights)
+
+        # Process chunks in parallel
+        n_jobs = self.params["n_jobs"]
+        results = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(self._eval_chunk)(chunk, **params) for chunk in chunks
+        )
+
+        # Flatten results back to list of flights
+        output_flights = []
+        for fleet_result in results:
+            output_flights.extend(fleet_result.to_flight_list())
+
+        return output_flights
 
     def set_source(self, source: ModelInput = None) -> None:
         """Attach original or copy of input ``source`` to :attr:`source`.
