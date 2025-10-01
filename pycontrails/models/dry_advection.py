@@ -204,8 +204,9 @@ class DryAdvection(models.Model):
             dt_integration = self.params["dt_integration"]
             t0 = pd.Timestamp(source_time.min()).floor(pd.Timedelta(dt_integration)).to_numpy()
             t1 = source_time.max()
+            # Start at t0 (age=0) instead of t0+dt_integration to include aircraft positions
             timesteps = np.arange(
-                t0 + dt_integration, t1 + dt_integration + max_age, dt_integration
+                t0, t1 + dt_integration + max_age, dt_integration
             )
 
         vector2 = GeoVectorDataset()
@@ -213,8 +214,15 @@ class DryAdvection(models.Model):
 
         evolved = []
         tmin = source_time.min()
+        first_step = True
         for t in timesteps:
-            filt = (source_time < t) & (source_time >= tmin)
+            # On first step, use <= to include waypoints at exactly t (age=0)
+            # On subsequent steps, use < to avoid duplicates
+            if first_step:
+                filt = (source_time <= t) & (source_time >= tmin)
+                first_step = False
+            else:
+                filt = (source_time < t) & (source_time >= tmin)
             tmin = t
 
             vector1 = vector2 + self.source.filter(filt, copy=False)

@@ -48,10 +48,10 @@ def _eval_chunk_with_met_path(
 
     Parameters
     ----------
-    model_class : type[Model]
+    model_class : type
         Model class to instantiate
     met_path : str | None
-        Path to temporary NetCDF file containing met data
+        Path to joblib file containing met data
     chunk : list[Flight]
         Chunk of flights to process
     model_params : dict[str, Any]
@@ -62,7 +62,7 @@ def _eval_chunk_with_met_path(
     Returns
     -------
     GeoVectorDataset
-        Evaluated result
+        Evaluated result for the chunk (may be Fleet or plain GeoVectorDataset)
     """
     # Load met data from joblib file with memory mapping
     met = None
@@ -91,9 +91,11 @@ def _eval_chunk_with_met_path(
     # Disable parallel to avoid nested parallelism
     params_copy = model_params.copy()
     params_copy["parallel"] = False
+    params_copy["downselect_met"] = False  # Met already downselected by parent
     model = model_class(met=met, params=params_copy)
 
     # Convert chunk to Fleet and evaluate
+    # This allows all flights in chunk to evolve together through timesteps
     fleet = Fleet.from_seq(chunk)
     result = model.eval(fleet, **eval_params)
 
