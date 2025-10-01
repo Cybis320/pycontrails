@@ -819,7 +819,6 @@ class Model(ABC):
             # This prevents copying the met data to each worker
             results = Parallel(
                 n_jobs=n_jobs,
-                verbose=10,
                 backend='loky',
                 max_nbytes='1M'  # Memmap anything larger than 1MB
             )(
