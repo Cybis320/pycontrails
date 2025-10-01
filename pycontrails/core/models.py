@@ -7,6 +7,8 @@ import functools
 import hashlib
 import json
 import logging
+import os
+import tempfile
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -30,6 +32,73 @@ from pycontrails.utils.json import NumpyEncoder
 from pycontrails.utils.types import type_guard
 
 logger = logging.getLogger(__name__)
+
+
+def _eval_chunk_with_met_path(
+    model_class: type,
+    met_path: str | None,
+    chunk: list[Flight],
+    model_params: dict[str, Any],
+    eval_params: dict[str, Any],
+) -> GeoVectorDataset:
+    """Worker function to evaluate a chunk of flights with met data loaded from file.
+
+    This function is called by parallel workers. It loads met data from a file path
+    instead of receiving a pickled copy, which saves memory.
+
+    Parameters
+    ----------
+    model_class : type[Model]
+        Model class to instantiate
+    met_path : str | None
+        Path to temporary NetCDF file containing met data
+    chunk : list[Flight]
+        Chunk of flights to process
+    model_params : dict[str, Any]
+        Model parameters
+    eval_params : dict[str, Any]
+        Parameters to pass to eval()
+
+    Returns
+    -------
+    GeoVectorDataset
+        Evaluated result
+    """
+    # Load met data from joblib file with memory mapping
+    met = None
+    if met_path is not None:
+        from joblib import load
+        import xarray as xr
+
+        # Load with memory mapping - arrays will be np.memmap
+        met_dict = load(met_path, mmap_mode='r')
+
+        # Reconstruct xarray Dataset from memory-mapped arrays
+        coords_dict = {}
+        for coord_name, coord_arr in met_dict['coords'].items():
+            coords_dict[coord_name] = coord_arr
+
+        data_vars_dict = {}
+        for var_name, var_data in met_dict['data_vars'].items():
+            arr = var_data['data']
+            data_vars_dict[var_name] = (var_data['dims'], arr, var_data['attrs'])
+
+        # Create xarray Dataset with memory-mapped arrays
+        ds = xr.Dataset(data_vars_dict, coords=coords_dict, attrs=met_dict['attrs'])
+        met = MetDataset(ds)
+
+    # Create model instance with loaded met data
+    # Disable parallel to avoid nested parallelism
+    params_copy = model_params.copy()
+    params_copy["parallel"] = False
+    model = model_class(met=met, params=params_copy)
+
+    # Convert chunk to Fleet and evaluate
+    fleet = Fleet.from_seq(chunk)
+    result = model.eval(fleet, **eval_params)
+
+    return result  # type: ignore[return-value]
+
 
 #: Model input source types
 ModelInput = MetDataset | GeoVectorDataset | Flight | Sequence[Flight] | None
@@ -600,7 +669,7 @@ class Model(ABC):
 
     def _eval_chunk(
         self, chunk: list[Flight], **params: Any
-    ) -> Fleet:
+    ) -> GeoVectorDataset:
         """Evaluate a chunk of flights.
 
         This method is called by parallel workers. It converts the chunk
@@ -615,8 +684,8 @@ class Model(ABC):
 
         Returns
         -------
-        Fleet
-            Evaluated fleet
+        GeoVectorDataset
+            Evaluated result as GeoVectorDataset (may be Fleet or plain GeoVectorDataset)
         """
         # Convert chunk to Fleet
         fleet = Fleet.from_seq(chunk)
@@ -627,6 +696,9 @@ class Model(ABC):
             result = self.eval(fleet, **params)
         finally:
             self.params["parallel"] = original_parallel
+
+        # If result is already a GeoVectorDataset (not Fleet), return as-is
+        # The caller will handle conversion back to flights
         return result  # type: ignore[return-value]
 
     def eval_parallel(
@@ -636,6 +708,9 @@ class Model(ABC):
 
         This method splits flights into chunks, processes each chunk as a Fleet
         in parallel, and returns the combined results.
+
+        To avoid memory duplication, the met dataset is saved to a temporary file
+        and workers load it from there instead of receiving a pickled copy.
 
         Parameters
         ----------
@@ -666,16 +741,117 @@ class Model(ABC):
         # Split flights into chunks
         chunks = self._split_flights_into_chunks(flights)
 
-        # Process chunks in parallel
-        n_jobs = self.params["n_jobs"]
-        results = Parallel(n_jobs=n_jobs, verbose=10)(
-            delayed(self._eval_chunk)(chunk, **params) for chunk in chunks
-        )
+        # Extract numpy arrays from MetDataset and save for memory mapping
+        # joblib can only memmap top-level arrays, not nested xarray structures
+        met_path = None
+        temp_file_created = False
+        if self.met is not None:
+            from joblib import dump
+
+            logger.info("Preparing met data for parallel processing")
+
+            # Get required variables for this model to avoid loading unnecessary data
+            required_vars = set()
+            if hasattr(self, 'met_variables'):
+                for var in self.met_variables:
+                    if isinstance(var, tuple):
+                        # Take all variants (model-agnostic, ECMWF, GFS)
+                        for v in var:
+                            required_vars.add(v.standard_name)
+                    else:
+                        required_vars.add(var.standard_name)
+
+            # Extract all data as numpy arrays for memory mapping
+            # Store metadata separately to reconstruct MetDataset in workers
+            met_dict = {
+                'coords': {},
+                'data_vars': {},
+                'attrs': dict(self.met.attrs),
+            }
+
+            # Extract coordinates as numpy arrays
+            for coord_name, coord_data in self.met.data.coords.items():
+                met_dict['coords'][coord_name] = np.asarray(coord_data.values)
+
+            # Extract data variables as numpy arrays (forcing load of lazy arrays)
+            # Only include variables required by the model
+            for var_name in self.met.data.data_vars:
+                # Check if this variable is needed by the model
+                da = self.met.data[var_name]
+                var_attrs = da.attrs
+                standard_name = var_attrs.get('standard_name', var_name)
+
+                # Skip variables not required by this model (saves memory)
+                if required_vars and standard_name not in required_vars:
+                    logger.debug(f"Skipping variable '{var_name}' (not required by {self.name})")
+                    continue
+                da = self.met.data[var_name]
+                # Force load if lazy (dask)
+                if hasattr(da.data, 'compute'):
+                    arr = da.data.compute()
+                else:
+                    arr = da.values
+                met_dict['data_vars'][var_name] = {
+                    'data': np.asarray(arr),
+                    'dims': da.dims,
+                    'attrs': dict(da.attrs),
+                }
+
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(suffix='.joblib', delete=False) as f:
+                met_path = f.name
+            temp_file_created = True
+
+            # Save extracted arrays - joblib will memmap these numpy arrays
+            dump(met_dict, met_path, compress=0)
+
+            file_size_mb = os.path.getsize(met_path) / 1e6
+            logger.info(f"Met data saved to temp file ({file_size_mb:.1f} MB)")
+
+        try:
+            # Process chunks in parallel
+            # Pass met_path instead of self to avoid pickling self.met
+            n_jobs = self.params["n_jobs"]
+            model_class = type(self)
+            model_params = self.params.copy()
+
+            # Use 'loky' backend with max_nbytes=1M to force memmapping of large objects
+            # This prevents copying the met data to each worker
+            results = Parallel(
+                n_jobs=n_jobs,
+                verbose=10,
+                backend='loky',
+                max_nbytes='1M'  # Memmap anything larger than 1MB
+            )(
+                delayed(_eval_chunk_with_met_path)(
+                    model_class, met_path, chunk, model_params, params
+                ) for chunk in chunks
+            )
+        finally:
+            # Clean up temporary file only if we created it
+            if temp_file_created and met_path is not None and os.path.exists(met_path):
+                logger.info(f"Removing temporary met file: {met_path}")
+                os.unlink(met_path)
 
         # Flatten results back to list of flights
         output_flights = []
-        for fleet_result in results:
-            output_flights.extend(fleet_result.to_flight_list())
+        for result in results:
+            # Handle both Fleet (which has to_flight_list) and plain GeoVectorDataset
+            if hasattr(result, 'to_flight_list'):
+                # Result is a Fleet
+                output_flights.extend(result.to_flight_list())
+            elif isinstance(result, GeoVectorDataset) and 'flight_id' in result:
+                # Result is a GeoVectorDataset with flight_id - convert back to flights
+                flight_ids = np.unique(result['flight_id'])
+                for fid in flight_ids:
+                    mask = result['flight_id'] == fid
+                    flight_data = result.filter(mask)
+                    # Convert to Flight
+                    flight = Flight(flight_data.data)
+                    output_flights.append(flight)
+            else:
+                msg = f"Unexpected result type from _eval_chunk: {type(result)}"
+                raise TypeError(msg)
 
         return output_flights
 

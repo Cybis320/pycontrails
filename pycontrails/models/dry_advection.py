@@ -163,15 +163,25 @@ class DryAdvection(models.Model):
         """
         self.update_params(params)
 
-        # Handle parallel processing if enabled
-        if self.params.get("parallel", False) and isinstance(source, Sequence):
-            return self.eval_parallel(list(source), **params)
-
         max_age = self.params["max_age"]
         timesteps = self.params["timesteps"]
         if max_age is None and timesteps is None:
             msg = "Timesteps must be set using the timesteps parameter when max_age is None"
             raise ValueError(msg)
+
+        # Handle parallel processing EARLY if enabled
+        # We need to downselect met based on all flights, then spawn workers
+        if self.params.get("parallel", False) and isinstance(source, Sequence):
+            # Convert to Fleet temporarily to get bounds for downselection
+            from pycontrails.core.fleet import Fleet
+            temp_fleet = Fleet.from_seq(source)
+            self.source = temp_fleet
+
+            # Downselect met to region covering all flights
+            self.downselect_met()
+
+            # Now do parallel processing with downselected met
+            return self.eval_parallel(list(source), **params)
 
         self.set_source(source)
         self.source = self.require_source_type(GeoVectorDataset)
