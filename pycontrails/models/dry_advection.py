@@ -81,6 +81,24 @@ class DryAdvectionParams(models.AdvectionBuffers):
     #: source points as well as evolved points.
     include_source_in_output: bool = False
 
+    #: Apply simplified constant downwash to source waypoints.
+    #: If True, source waypoints are displaced downward by :attr:`downwash_distance`
+    #: before advection begins, simulating wake vortex descent.
+    #: .. versionadded:: 0.54.12
+    apply_downwash: bool = False
+
+    #: Downward displacement distance for simplified downwash model, [:math:`m`].
+    #: Only applies when :attr:`apply_downwash` is True.
+    #: Default of 300m represents typical wake vortex descent.
+    #: .. versionadded:: 0.54.12
+    downwash_distance: float = 300.0
+
+    #: Duration over which downwash occurs.
+    #: Downwash is applied linearly from waypoint creation time until
+    #: creation_time + downwash_duration, reaching :attr:`downwash_distance`.
+    #: .. versionadded:: 0.54.12
+    downwash_duration: np.timedelta64 = np.timedelta64(1, "m")
+
 
 class DryAdvection(models.Model):
     """Simulate "dry advection" of an emissions plume with an elliptical cross section.
@@ -102,6 +120,12 @@ class DryAdvection(models.Model):
         advect points with wind shear effects. At each time step, the model
         will evolve the plume geometry according to diffusion and wind shear
         effects. This mode is also used in :class:`CocipGrid` and :class:`Cocip`.
+
+    .. versionadded:: 0.54.12
+
+        Added simplified downwash support via ``apply_downwash`` parameter.
+        When enabled, waypoints descend linearly over ``downwash_duration``
+        (default 1 minute) to simulate wake vortex descent.
 
     Parameters
     ----------
@@ -248,6 +272,10 @@ class DryAdvection(models.Model):
                 **interp_kwargs,
             )
 
+            # Apply gradual downwash if enabled
+            if self.params["apply_downwash"]:
+                vector2 = self._apply_downwash_to_waypoint(vector2, t)
+
             filt = vector2.coords_intersect_met(self.met)
             if max_age is not None:
                 filt &= vector2["age"] <= max_age
@@ -350,6 +378,47 @@ class DryAdvection(models.Model):
         buffers["time_buffer"] = (np.timedelta64(0, "ns"), max_age)
 
         self.met = self.source.downselect_met(self.met, **buffers)
+
+    def _apply_downwash_to_waypoint(
+        self, vector: GeoVectorDataset, current_time: np.datetime64
+    ) -> GeoVectorDataset:
+        """Apply gradual downwash displacement based on waypoint age.
+
+        Downwash is applied linearly over :attr:`downwash_duration`.
+        After the duration, displacement equals :attr:`downwash_distance`.
+
+        Parameters
+        ----------
+        vector : GeoVectorDataset
+            Waypoints to apply downwash to
+        current_time : np.datetime64
+            Current simulation time
+
+        Returns
+        -------
+        GeoVectorDataset
+            Waypoints with downwash applied
+
+        .. versionadded:: 0.54.12
+        """
+        downwash_dist = self.params["downwash_distance"]
+        downwash_duration = self.params["downwash_duration"]
+
+        # Calculate age of each waypoint
+        age = current_time - vector["time"]
+
+        # Linear downwash: fraction of total distance based on time elapsed
+        # age_fraction is clamped to [0, 1]
+        age_seconds = age / np.timedelta64(1, "s")
+        duration_seconds = downwash_duration / np.timedelta64(1, "s")
+        age_fraction = np.minimum(age_seconds / duration_seconds, 1.0)
+
+        # Apply proportional downward displacement
+        displacement = downwash_dist * age_fraction
+        new_altitude = vector.altitude - displacement
+        vector.update(altitude=new_altitude)
+
+        return vector
 
 
 def _perform_interp_for_step(
