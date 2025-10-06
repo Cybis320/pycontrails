@@ -22,6 +22,7 @@ from pycontrails.core.met import MetDataset, maybe_downselect_mds
 from pycontrails.core.met_var import (
     AirTemperature,
     EastwardWind,
+    Geopotential,
     MetVariable,
     NorthwardWind,
     VerticalVelocity,
@@ -117,6 +118,7 @@ class DryAdvection(models.Model):
     met_variables: tuple[MetVariable, ...] = (
         AirTemperature,
         EastwardWind,
+        Geopotential,
         NorthwardWind,
         VerticalVelocity,
     )
@@ -204,7 +206,7 @@ class DryAdvection(models.Model):
             dt_integration = self.params["dt_integration"]
             t0 = pd.Timestamp(source_time.min()).floor(pd.Timedelta(dt_integration)).to_numpy()
             t1 = source_time.max()
-            # Start at t0 (age=0) instead of t0+dt_integration to include aircraft positions
+            # Start at t0 instead of t0+dt to include age=0 (aircraft position)
             timesteps = np.arange(
                 t0, t1 + dt_integration + max_age, dt_integration
             )
@@ -214,13 +216,13 @@ class DryAdvection(models.Model):
 
         evolved = []
         tmin = source_time.min()
-        first_step = True
+        first_timestep = True
         for t in timesteps:
-            # On first step, use <= to include waypoints at exactly t (age=0)
-            # On subsequent steps, use < to avoid duplicates
-            if first_step:
+            # First timestep: use <= to include waypoints at exactly t (age=0)
+            # Subsequent timesteps: use < to avoid duplicates
+            if first_timestep:
                 filt = (source_time <= t) & (source_time >= tmin)
-                first_step = False
+                first_timestep = False
             else:
                 filt = (source_time < t) & (source_time >= tmin)
             tmin = t
