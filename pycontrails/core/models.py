@@ -819,10 +819,12 @@ class Model(ABC):
 
             # Use 'loky' backend with max_nbytes=1M to force memmapping of large objects
             # This prevents copying the met data to each worker
+            # CRITICAL: Use prefer="processes" to force fresh process pool (not threads)
             results = Parallel(
                 n_jobs=n_jobs,
                 backend='loky',
-                max_nbytes='1M'  # Memmap anything larger than 1MB
+                max_nbytes='1M',  # Memmap anything larger than 1MB
+                prefer="processes"
             )(
                 delayed(_eval_chunk_with_met_path)(
                     model_class, met_path, chunk, model_params, params
@@ -833,6 +835,33 @@ class Model(ABC):
             if temp_file_created and met_path is not None and os.path.exists(met_path):
                 logger.info(f"Removing temporary met file: {met_path}")
                 os.unlink(met_path)
+
+            # Clean up loky executor to prevent resource leaks
+            # This MUST happen after file cleanup to ensure workers have released file handles
+            # Critical for preventing semlock/folder leaks in batch processing scenarios
+            try:
+                import gc
+                from joblib.externals.loky import reusable_executor
+
+                # Access the global executor state directly and shut it down
+                # This is the actual executor used by Parallel()
+                with reusable_executor._executor_lock:
+                    if reusable_executor._executor is not None:
+                        try:
+                            # Graceful shutdown (not kill_workers to avoid corruption)
+                            reusable_executor._executor.shutdown(wait=True)
+                        except Exception as e:
+                            logger.debug(f"Error during executor shutdown: {e}")
+                        finally:
+                            # Clear the global executor reference to force fresh executor next time
+                            reusable_executor._executor = None
+                            reusable_executor._executor_kwargs = None
+
+                # Force garbage collection to clean up any lingering references
+                gc.collect()
+            except Exception as e:
+                # Log but don't raise to avoid masking other exceptions
+                logger.debug(f"Error during executor cleanup: {e}")
 
         # Flatten results back to list of flights
         output_flights = []
