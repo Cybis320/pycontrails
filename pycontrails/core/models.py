@@ -34,12 +34,53 @@ from pycontrails.utils.types import type_guard
 logger = logging.getLogger(__name__)
 
 
+def _load_met_from_path(met_path: str) -> MetDataset:
+    """Load MetDataset from a joblib file with memory mapping.
+
+    Parameters
+    ----------
+    met_path : str
+        Path to joblib file containing met data
+
+    Returns
+    -------
+    MetDataset
+        Reconstructed MetDataset with memory-mapped arrays
+    """
+    from joblib import load
+    import xarray as xr
+
+    # Load with memory mapping - arrays will be np.memmap
+    met_dict = load(met_path, mmap_mode='r')
+
+    # Reconstruct xarray Dataset from memory-mapped arrays
+    # First build coordinates with proper dimensions
+    coords_dict = {}
+    for coord_name, coord_info in met_dict['coords'].items():
+        if isinstance(coord_info, dict):
+            # Coordinate with dims/attrs info
+            coords_dict[coord_name] = (coord_info['dims'], coord_info['data'], coord_info.get('attrs', {}))
+        else:
+            # Simple 1D coordinate (legacy format or simple coords)
+            coords_dict[coord_name] = coord_info
+
+    data_vars_dict = {}
+    for var_name, var_data in met_dict['data_vars'].items():
+        arr = var_data['data']
+        data_vars_dict[var_name] = (var_data['dims'], arr, var_data['attrs'])
+
+    # Create xarray Dataset with memory-mapped arrays
+    ds = xr.Dataset(data_vars_dict, coords=coords_dict, attrs=met_dict['attrs'])
+    return MetDataset(ds)
+
+
 def _eval_chunk_with_met_path(
     model_class: type,
     met_path: str | None,
     chunk: list[Flight],
     model_params: dict[str, Any],
     eval_params: dict[str, Any],
+    rad_path: str | None = None,
 ) -> GeoVectorDataset:
     """Worker function to evaluate a chunk of flights with met data loaded from file.
 
@@ -58,6 +99,8 @@ def _eval_chunk_with_met_path(
         Model parameters
     eval_params : dict[str, Any]
         Parameters to pass to eval()
+    rad_path : str | None
+        Path to joblib file containing radiation data (for CoCiP)
 
     Returns
     -------
@@ -67,32 +110,24 @@ def _eval_chunk_with_met_path(
     # Load met data from joblib file with memory mapping
     met = None
     if met_path is not None:
-        from joblib import load
-        import xarray as xr
+        met = _load_met_from_path(met_path)
 
-        # Load with memory mapping - arrays will be np.memmap
-        met_dict = load(met_path, mmap_mode='r')
-
-        # Reconstruct xarray Dataset from memory-mapped arrays
-        coords_dict = {}
-        for coord_name, coord_arr in met_dict['coords'].items():
-            coords_dict[coord_name] = coord_arr
-
-        data_vars_dict = {}
-        for var_name, var_data in met_dict['data_vars'].items():
-            arr = var_data['data']
-            data_vars_dict[var_name] = (var_data['dims'], arr, var_data['attrs'])
-
-        # Create xarray Dataset with memory-mapped arrays
-        ds = xr.Dataset(data_vars_dict, coords=coords_dict, attrs=met_dict['attrs'])
-        met = MetDataset(ds)
+    # Load rad data if provided (for CoCiP)
+    rad = None
+    if rad_path is not None:
+        rad = _load_met_from_path(rad_path)
 
     # Create model instance with loaded met data
     # Disable parallel to avoid nested parallelism
     params_copy = model_params.copy()
     params_copy["parallel"] = False
     params_copy["downselect_met"] = False  # Met already downselected by parent
-    model = model_class(met=met, params=params_copy)
+
+    # Handle models that require rad (like CoCiP)
+    if rad is not None:
+        model = model_class(met=met, rad=rad, params=params_copy)
+    else:
+        model = model_class(met=met, params=params_copy)
 
     # Convert chunk to Fleet and evaluate
     # This allows all flights in chunk to evolve together through timesteps
@@ -703,6 +738,72 @@ class Model(ABC):
         # The caller will handle conversion back to flights
         return result  # type: ignore[return-value]
 
+    def _save_met_to_temp_file(
+        self,
+        met_data: MetDataset,
+        label: str,
+    ) -> tuple[str, bool]:
+        """Save MetDataset to a temporary file for parallel processing.
+
+        Parameters
+        ----------
+        met_data : MetDataset
+            The met or rad dataset to save
+        label : str
+            Label for logging (e.g., "met" or "rad")
+
+        Returns
+        -------
+        tuple[str, bool]
+            Tuple of (file_path, temp_file_created)
+        """
+        from joblib import dump
+
+        # Extract all data as numpy arrays for memory mapping
+        # Store metadata separately to reconstruct MetDataset in workers
+        met_dict = {
+            'coords': {},
+            'data_vars': {},
+            'attrs': dict(met_data.attrs),
+        }
+
+        # Extract coordinates with their dims and attrs
+        for coord_name, coord_data in met_data.data.coords.items():
+            met_dict['coords'][coord_name] = {
+                'data': np.asarray(coord_data.values),
+                'dims': coord_data.dims,
+                'attrs': dict(coord_data.attrs),
+            }
+
+        # Extract data variables as numpy arrays (forcing load of lazy arrays)
+        # Save all variables - filtering by standard_name is unreliable due to
+        # provider-specific variants (e.g., ciwc vs cli for cloud ice)
+        for var_name in met_data.data.data_vars:
+            da = met_data.data[var_name]
+
+            # Force load if lazy (dask)
+            if hasattr(da.data, 'compute'):
+                arr = da.data.compute()
+            else:
+                arr = da.values
+            met_dict['data_vars'][var_name] = {
+                'data': np.asarray(arr),
+                'dims': da.dims,
+                'attrs': dict(da.attrs),
+            }
+
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(suffix='.joblib', delete=False) as f:
+            file_path = f.name
+
+        # Save extracted arrays - joblib will memmap these numpy arrays
+        dump(met_dict, file_path, compress=0)
+
+        file_size_mb = os.path.getsize(file_path) / 1e6
+        logger.info(f"{label.capitalize()} data saved to temp file ({file_size_mb:.1f} MB)")
+
+        return file_path, True
+
     def eval_parallel(
         self, flights: list[Flight], **params: Any
     ) -> list[Flight]:
@@ -746,69 +847,18 @@ class Model(ABC):
         # Extract numpy arrays from MetDataset and save for memory mapping
         # joblib can only memmap top-level arrays, not nested xarray structures
         met_path = None
-        temp_file_created = False
+        rad_path = None
+        met_temp_created = False
+        rad_temp_created = False
+
         if self.met is not None:
-            from joblib import dump
-
             logger.info("Preparing met data for parallel processing")
+            met_path, met_temp_created = self._save_met_to_temp_file(self.met, "met")
 
-            # Get required variables for this model to avoid loading unnecessary data
-            required_vars = set()
-            if hasattr(self, 'met_variables'):
-                for var in self.met_variables:
-                    if isinstance(var, tuple):
-                        # Take all variants (model-agnostic, ECMWF, GFS)
-                        for v in var:
-                            required_vars.add(v.standard_name)
-                    else:
-                        required_vars.add(var.standard_name)
-
-            # Extract all data as numpy arrays for memory mapping
-            # Store metadata separately to reconstruct MetDataset in workers
-            met_dict = {
-                'coords': {},
-                'data_vars': {},
-                'attrs': dict(self.met.attrs),
-            }
-
-            # Extract coordinates as numpy arrays
-            for coord_name, coord_data in self.met.data.coords.items():
-                met_dict['coords'][coord_name] = np.asarray(coord_data.values)
-
-            # Extract data variables as numpy arrays (forcing load of lazy arrays)
-            # Only include variables required by the model
-            for var_name in self.met.data.data_vars:
-                # Check if this variable is needed by the model
-                da = self.met.data[var_name]
-                var_attrs = da.attrs
-                standard_name = var_attrs.get('standard_name', var_name)
-
-                # Skip variables not required by this model (saves memory)
-                if required_vars and standard_name not in required_vars:
-                    logger.debug(f"Skipping variable '{var_name}' (not required by {self.name})")
-                    continue
-                da = self.met.data[var_name]
-                # Force load if lazy (dask)
-                if hasattr(da.data, 'compute'):
-                    arr = da.data.compute()
-                else:
-                    arr = da.values
-                met_dict['data_vars'][var_name] = {
-                    'data': np.asarray(arr),
-                    'dims': da.dims,
-                    'attrs': dict(da.attrs),
-                }
-
-            # Create temporary file
-            with tempfile.NamedTemporaryFile(suffix='.joblib', delete=False) as f:
-                met_path = f.name
-            temp_file_created = True
-
-            # Save extracted arrays - joblib will memmap these numpy arrays
-            dump(met_dict, met_path, compress=0)
-
-            file_size_mb = os.path.getsize(met_path) / 1e6
-            logger.info(f"Met data saved to temp file ({file_size_mb:.1f} MB)")
+        # Handle rad data for models like CoCiP
+        if hasattr(self, 'rad') and self.rad is not None:
+            logger.info("Preparing rad data for parallel processing")
+            rad_path, rad_temp_created = self._save_met_to_temp_file(self.rad, "rad")
 
         try:
             # Process chunks in parallel
@@ -827,14 +877,17 @@ class Model(ABC):
                 prefer="processes"
             )(
                 delayed(_eval_chunk_with_met_path)(
-                    model_class, met_path, chunk, model_params, params
+                    model_class, met_path, chunk, model_params, params, rad_path
                 ) for chunk in chunks
             )
         finally:
-            # Clean up temporary file only if we created it
-            if temp_file_created and met_path is not None and os.path.exists(met_path):
+            # Clean up temporary files
+            if met_temp_created and met_path is not None and os.path.exists(met_path):
                 logger.info(f"Removing temporary met file: {met_path}")
                 os.unlink(met_path)
+            if rad_temp_created and rad_path is not None and os.path.exists(rad_path):
+                logger.info(f"Removing temporary rad file: {rad_path}")
+                os.unlink(rad_path)
 
             # Clean up loky executor to prevent resource leaks
             # This MUST happen after file cleanup to ensure workers have released file handles

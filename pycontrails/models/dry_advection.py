@@ -17,6 +17,7 @@ import numpy.typing as npt
 import pandas as pd
 
 from pycontrails.core import models
+from pycontrails.core.fleet import Fleet
 from pycontrails.core.flight import Flight
 from pycontrails.core.met import MetDataset, maybe_downselect_mds
 from pycontrails.core.met_var import (
@@ -199,7 +200,6 @@ class DryAdvection(models.Model):
         # We need to downselect met based on all flights, then spawn workers
         if self.params.get("parallel", False) and isinstance(source, Sequence):
             # Convert to Fleet temporarily to get bounds for downselection
-            from pycontrails.core.fleet import Fleet
             temp_fleet = Fleet.from_seq(source)
             self.source = temp_fleet
 
@@ -261,6 +261,14 @@ class DryAdvection(models.Model):
             t1 = vector1["time"].max()
             met = maybe_downselect_mds(self.met, met, t0, t1)
 
+            # Calculate downwash parameters if enabled
+            downwash_params = None
+            if self.params["apply_downwash"]:
+                downwash_params = {
+                    "distance": self.params["downwash_distance"],
+                    "duration": self.params["downwash_duration"],
+                }
+
             vector2 = _evolve_one_step(
                 met,
                 vector1,
@@ -269,12 +277,9 @@ class DryAdvection(models.Model):
                 dz_m=dz_m,
                 max_depth=max_depth,
                 verbose_outputs=verbose_outputs,
+                downwash_params=downwash_params,
                 **interp_kwargs,
             )
-
-            # Apply gradual downwash if enabled
-            if self.params["apply_downwash"]:
-                vector2 = self._apply_downwash_to_waypoint(vector2, t)
 
             filt = vector2.coords_intersect_met(self.met)
             if max_age is not None:
@@ -379,52 +384,11 @@ class DryAdvection(models.Model):
 
         self.met = self.source.downselect_met(self.met, **buffers)
 
-    def _apply_downwash_to_waypoint(
-        self, vector: GeoVectorDataset, current_time: np.datetime64
-    ) -> GeoVectorDataset:
-        """Apply gradual downwash displacement based on waypoint age.
-
-        Downwash is applied linearly over :attr:`downwash_duration`.
-        After the duration, displacement equals :attr:`downwash_distance`.
-
-        Parameters
-        ----------
-        vector : GeoVectorDataset
-            Waypoints to apply downwash to
-        current_time : np.datetime64
-            Current simulation time
-
-        Returns
-        -------
-        GeoVectorDataset
-            Waypoints with downwash applied
-
-        .. versionadded:: 0.54.12
-        """
-        downwash_dist = self.params["downwash_distance"]
-        downwash_duration = self.params["downwash_duration"]
-
-        # Calculate age of each waypoint
-        age = current_time - vector["time"]
-
-        # Linear downwash: fraction of total distance based on time elapsed
-        # age_fraction is clamped to [0, 1]
-        age_seconds = age / np.timedelta64(1, "s")
-        duration_seconds = downwash_duration / np.timedelta64(1, "s")
-        age_fraction = np.minimum(age_seconds / duration_seconds, 1.0)
-
-        # Apply proportional downward displacement
-        displacement = downwash_dist * age_fraction
-        new_altitude = vector.altitude - displacement
-        vector.update(altitude=new_altitude)
-
-        return vector
-
-
 def _perform_interp_for_step(
     met: MetDataset,
     vector: GeoVectorDataset,
     dz_m: float,
+    downwash_enabled: bool = False,
     **interp_kwargs: Any,
 ) -> None:
     """Perform all interpolation required for one step of advection."""
@@ -443,6 +407,11 @@ def _perform_interp_for_step(
     )
 
     az = vector.get("azimuth")
+
+    # Interpolate air_temperature if needed for downwash (even in pointwise mode)
+    if downwash_enabled and az is None:
+        models.interpolate_met(met, vector, "air_temperature", **interp_kwargs)
+
     if az is None:
         # Early exit for pointwise only simulation
         return
@@ -642,6 +611,7 @@ def _evolve_one_step(
     dz_m: float,
     max_depth: float | None,
     verbose_outputs: bool,
+    downwash_params: dict[str, Any] | None = None,
     **interp_kwargs: Any,
 ) -> GeoVectorDataset:
     """Evolve plume geometry by one step.
@@ -649,10 +619,51 @@ def _evolve_one_step(
     This method mutates the input ``vector`` in place.
     """
 
-    _perform_interp_for_step(met, vector, dz_m, **interp_kwargs)
+    downwash_enabled = downwash_params is not None
+    _perform_interp_for_step(met, vector, dz_m, downwash_enabled=downwash_enabled, **interp_kwargs)
     u_wind = vector["u_wind"]
     v_wind = vector["v_wind"]
     vertical_velocity = vector["vertical_velocity"] + sedimentation_rate
+
+    # Apply downwash as additional vertical velocity if enabled
+    if downwash_params is not None:
+        downwash_distance = downwash_params["distance"]
+        downwash_duration = downwash_params["duration"]
+
+        # Calculate age-dependent downwash velocity
+        # Linear decrease: v(age) = 2*D/T * (1 - age/T) for age < T
+        age = vector["age"]
+        age_seconds = age / np.timedelta64(1, "s")
+        duration_seconds = downwash_duration / np.timedelta64(1, "s")
+
+        # Fraction of duration elapsed (clamped to [0, 1])
+        age_fraction = np.minimum(age_seconds / duration_seconds, 1.0)
+
+        # Downwash velocity (m/s), linearly decreasing from 2*D/T to 0
+        # Using 2*D/T ensures total descent = D over duration T
+        max_downwash_velocity = 2.0 * downwash_distance / duration_seconds
+        downwash_velocity = max_downwash_velocity * (1.0 - age_fraction)
+
+        # Convert to pressure velocity (Pa/s) using hydrostatic relation
+        # dp/dz = -rho*g, where rho = p/(R*T) from ideal gas law
+        air_pressure = vector["air_pressure"]
+        air_temperature = vector["air_temperature"]
+
+        # Constants
+        R_air = 287.05  # J/(kg·K) - specific gas constant for dry air
+        g = 9.80665  # m/s² - gravitational acceleration
+
+        # Air density from ideal gas law
+        rho_air = air_pressure / (R_air * air_temperature)
+
+        # Pressure gradient: dp/dz = -rho*g
+        dp_dz = -rho_air * g  # Pa/m
+
+        # Convert downwash velocity to pressure rate
+        # Negative velocity (descent) gives positive pressure rate
+        downwash_pressure_rate = dp_dz * (-downwash_velocity)
+
+        vertical_velocity = vertical_velocity + downwash_pressure_rate
 
     latitude = vector["latitude"]
     longitude = vector["longitude"]

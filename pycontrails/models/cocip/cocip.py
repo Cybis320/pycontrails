@@ -424,6 +424,25 @@ class Cocip(Model):
 
         # Handle parallel processing if enabled
         if self.params.get("parallel", False) and isinstance(source, Sequence):
+            # Convert to Fleet temporarily to get bounds for downselection
+            temp_fleet = Fleet.from_seq(source)
+            self.source = temp_fleet
+
+            # Downselect met and rad to region covering all flights
+            # Use larger buffers for advection
+            buffers = {
+                f"{coord}_buffer": self.params[f"met_{coord}_buffer"]
+                for coord in ("longitude", "latitude", "level")
+            }
+            # Add time buffer for max_age
+            max_age = self.params.get("max_age", np.timedelta64(12, "h"))
+            if max_age is not None:
+                buffers["time_buffer"] = (np.timedelta64(0, "ns"), max_age)
+
+            self.met = self.source.downselect_met(self.met, **buffers)
+            self.rad = self.source.downselect_met(self.rad, **buffers)
+
+            # Now do parallel processing with downselected met/rad
             return self.eval_parallel(list(source), **params)
 
         self.set_source(source)
