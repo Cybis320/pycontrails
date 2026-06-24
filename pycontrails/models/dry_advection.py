@@ -230,9 +230,8 @@ class DryAdvection(models.Model):
             dt_integration = self.params["dt_integration"]
             t0 = pd.Timestamp(source_time.min()).floor(pd.Timedelta(dt_integration)).to_numpy()
             t1 = source_time.max()
-            # Start at t0 instead of t0+dt to include age=0 (aircraft position)
             timesteps = np.arange(
-                t0, t1 + dt_integration + max_age, dt_integration
+                t0 + dt_integration, t1 + dt_integration + max_age, dt_integration
             )
 
         vector2 = GeoVectorDataset()
@@ -240,15 +239,11 @@ class DryAdvection(models.Model):
 
         evolved = []
         tmin = source_time.min()
-        first_timestep = True
         for t in timesteps:
-            # First timestep: use <= to include waypoints at exactly t (age=0)
-            # Subsequent timesteps: use < to avoid duplicates
-            if first_timestep:
-                filt = (source_time <= t) & (source_time >= tmin)
-                first_timestep = False
-            else:
-                filt = (source_time < t) & (source_time >= tmin)
+            # Age-0 source waypoints are captured below by ``evolved.append(vector1)``
+            # before evolution; every ``_evolve_one_step`` call advances by dt > 0.
+            # Whether the age-0 state is kept is governed by ``include_source_in_output``.
+            filt = (source_time < t) & (source_time >= tmin)
             tmin = t
 
             vector1 = vector2 + self.source.filter(filt, copy=False)
@@ -383,6 +378,7 @@ class DryAdvection(models.Model):
         buffers["time_buffer"] = (np.timedelta64(0, "ns"), max_age)
 
         self.met = self.source.downselect_met(self.met, **buffers)
+
 
 def _perform_interp_for_step(
     met: MetDataset,
