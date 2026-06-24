@@ -51,23 +51,19 @@ Repository = "https://github.com/contrailcirrus/pycontrails"
 
 # All non-development dependencies
 # Only dependencies that work on all python versions
-complete = ["pycontrails[ecmwf,gcp,gfs,jupyter,pyproj,sat,vis,zarr]"]
+complete = ["pycontrails[dwd,ecmwf,gcp,gfs,jupyter,pyproj,sat,vis,zarr]"]
 
 # Development dependencies
 dev = [
-    "fastparquet>=0.8",
-    "ipdb>=0.13",
-    "memory_profiler",
     "mypy>=1.8",
-    "mypy-extensions>=1.0",
     "platformdirs>=3.0",
     "pre-commit>=2.10",
-    "psutil",
     "pyarrow>=5.0",
     "pytest>=8.2",
     "pytest-cov>=2.11",
-    "requests>=2.25",
-    "ruff>=0.9.0",
+    "requests>=2.33.1",
+    "ruff>=0.15.0",
+    "types-requests>=2.25",
 ]
 
 # Documentation / Sphinx dependencies
@@ -84,6 +80,16 @@ docs = [
     "sphinxcontrib-bibtex>=2.2",
     "sphinx_copybutton>=0.5",
     "sphinxext.opengraph>=0.8",
+]
+
+# DWD datalib interfaces
+dwd = [
+    "aiohttp>=3.13",
+    "cfgrib>=0.9",
+    "eccodes>=2.38",
+    "netcdf4>=1.6.1",
+    "platformdirs>=3.0",
+    "tqdm>=4.61",
 ]
 
 # ECMWF datalib interfaces
@@ -181,23 +187,11 @@ local_scheme = "no-local-version"
 [tool.mypy]
 ignore_missing_imports = true
 disallow_untyped_defs = true
-# disallow_any_generics = true  # TODO: support this in the future
+disallow_any_generics = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 warn_no_return = false
 show_error_codes = true
-
-# # --strict
-# disallow_untyped_calls = true
-# disallow_subclassing_any = true
-# disallow_incomplete_defs = true
-# disallow_untyped_decorators = true
-# no_implicit_optional = true
-# warn_unused_ignores = true
-# warn_return_any = true
-# implicit_reexport = false
-# strict_equality = true
-# # --strict end
 
 # pytest
 # https://docs.pytest.org/en/7.1.x/reference/customize.html
@@ -211,7 +205,6 @@ filterwarnings = [
     "ignore:`np.bool8` is a deprecated alias:DeprecationWarning:skimage.util.dtype",
     "ignore:'cgi' is deprecated and slated:DeprecationWarning:google.cloud.storage.blob",
     "ignore:Engine 'cfgrib' loading failed:RuntimeWarning:xarray.backends.plugins",
-    "ignore:.*IPyNbFile:pytest.PytestRemovedIn9Warning:_pytest.nodes",
     "ignore:.*pkg_resources:DeprecationWarning",
     "ignore:The default level_type will change:DeprecationWarning",
     "ignore:Conversion of an array with ndim > 0 to a scalar:DeprecationWarning:pyproj.transformer",
@@ -290,3 +283,14 @@ extend-immutable-calls = ["numpy.timedelta64", "numpy.float32", "os.path.join"]
 style = "numpy"
 skip-checking-raises = true
 check-class-attributes = false
+
+# https://cibuildwheel.pypa.io/en/stable/options/
+[tool.cibuildwheel]
+build = ["cp311-*", "cp312-*", "cp313-*", "cp314-*"]
+skip = ["*-win32", "*-manylinux_i686", "*-musllinux*", "*-macosx_x86_64"]
+build-verbosity = 3
+test-extras = ["complete", "dev"]
+# Force tests that make network calls to be skipped (see tests/__init__.py)
+environment = { PYCONTRAILS_OFFLINE = "1" }
+test-command = "python -m pytest ./tests -vv"
+test-sources = ["tests", "pyproject.toml"]

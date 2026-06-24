@@ -16,7 +16,6 @@ else:
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-import xarray as xr
 
 from pycontrails.core import met_var, models
 from pycontrails.core.aircraft_performance import AircraftPerformance
@@ -224,7 +223,6 @@ class Cocip(Model):
         "_downwash_flight",
         "_sac_flight",
         "contrail",
-        "contrail_dataset",
         "contrail_list",
         "rad",
         "timesteps",
@@ -329,9 +327,6 @@ class Cocip(Model):
     #:   :func:`contrail_properties.energy_forcing`.
     contrail: pd.DataFrame | None
 
-    #: :class:`xr.Dataset` representation of contrail evolution.
-    contrail_dataset: xr.Dataset | None
-
     #: Array of :class:`numpy.datetime64` time steps for contrail evolution
     timesteps: npt.NDArray[np.datetime64]
 
@@ -351,19 +346,12 @@ class Cocip(Model):
         params: dict[str, Any] | None = None,
         **params_kwargs: Any,
     ) -> None:
-        # call Model init
         super().__init__(met, params=params, **params_kwargs)
 
         compute_tau_cirrus = self.params["compute_tau_cirrus_in_model_init"]
         self.met, self.rad = process_met_datasets(met, rad, compute_tau_cirrus)
 
-        # initialize outputs to None
-        self.contrail = None
-        self.contrail_dataset = None
-
-    # ----------
-    # Public API
-    # ----------
+        self.contrail = None  # initialize the contrail attribute to None
 
     @overload
     def eval(self, source: Fleet, **params: Any) -> Fleet: ...
@@ -741,7 +729,7 @@ class Cocip(Model):
         # has all of the required met variables attached. Therefore, we don't need to worry about
         # being consistent with passing in Cocip's interp_kwargs and humidity_scaling into
         # the sub-models.
-        emissions = Emissions()
+        emissions_model = self.params["emissions"] or Emissions()
         ap_model = self.params["aircraft_performance"]
 
         # Run against a list of flights (Fleet)
@@ -753,7 +741,7 @@ class Cocip(Model):
 
             # In Fleet-mode, always call emissions
             logger.debug("Separately running emissions on each flight in fleet")
-            fls = [_eval_emissions(emissions, fl) for fl in fls]
+            fls = [_eval_emissions(emissions_model, fl) for fl in fls]
 
             # Broadcast numeric AP and emissions variables back to Fleet.data
             for fl in fls:
@@ -768,7 +756,7 @@ class Cocip(Model):
         # Single flight
         else:
             self.source = _eval_aircraft_performance(ap_model, self.source)
-            self.source = _eval_emissions(emissions, self.source)
+            self.source = _eval_emissions(emissions_model, self.source)
 
         # Scale nvPM with parameter (fleet / flight)
         factor = self.params["nvpm_ei_n_enhancement_factor"]
@@ -911,6 +899,7 @@ class Cocip(Model):
             air_pressure,
             effective_vertical_resolution=self.params["effective_vertical_resolution"],
             wind_shear_enhancement_exponent=self.params["wind_shear_enhancement_exponent"],
+            turbulent_vertical_velocity_scale=self.params["turbulent_vertical_velocity_scale"],
         )
 
         # derive downwash values and save to data model
@@ -955,7 +944,12 @@ class Cocip(Model):
         fuel_dist = fuel_flow / true_airspeed
 
         nvpm_ei_n = self._sac_flight.get_data_or_attr("nvpm_ei_n")
-        ei_h2o = self._sac_flight.fuel.ei_h2o
+
+        ei_h2o: npt.NDArray[np.floating] | float
+        if "ei_h2o" in self._sac_flight:  # keep backdoor open to fuel-varying fleet
+            ei_h2o = self._sac_flight["ei_h2o"]
+        else:
+            ei_h2o = self._sac_flight.fuel.ei_h2o
 
         # get initial contrail parameters from wake vortex simulation
         width = self._sac_flight["width"]
@@ -1006,16 +1000,32 @@ class Cocip(Model):
         iwc_1 = contrail_properties.iwc_post_wake_vortex(iwc, iwc_ad)
 
         if self.params["vpm_activation"]:
-            # We can add a Cocip parameter for T_exhaust, vpm_ei_n, and particles
-            aei = extended_k15.droplet_apparent_emission_index(
-                specific_humidity=specific_humidity,
-                T_ambient=air_temperature,
+            is_lean_burn = nvpm_ei_n < 1.0e12
+
+            aei = np.empty_like(nvpm_ei_n)
+
+            # Rich-burn engines
+            aei[~is_lean_burn] = extended_k15.droplet_apparent_emission_index(
+                specific_humidity=specific_humidity[~is_lean_burn],
+                T_ambient=air_temperature[~is_lean_burn],
                 T_exhaust=self.source.attrs.get("T_exhaust", extended_k15.DEFAULT_EXHAUST_T),
-                air_pressure=air_pressure,
-                nvpm_ei_n=nvpm_ei_n,
-                vpm_ei_n=self.source.attrs.get("vpm_ei_n", extended_k15.DEFAULT_VPM_EI_N),
-                G=self._sac_flight["G"],
+                air_pressure=air_pressure[~is_lean_burn],
+                nvpm_ei_n=nvpm_ei_n[~is_lean_burn],
+                G=self._sac_flight["G"][~is_lean_burn],
+                particles=self.params["particles_rich_burn"],
             )
+
+            # Lean-burn engines
+            aei[is_lean_burn] = extended_k15.droplet_apparent_emission_index(
+                specific_humidity=specific_humidity[is_lean_burn],
+                T_ambient=air_temperature[is_lean_burn],
+                T_exhaust=self.source.attrs.get("T_exhaust", extended_k15.DEFAULT_EXHAUST_T),
+                air_pressure=air_pressure[is_lean_burn],
+                nvpm_ei_n=nvpm_ei_n[is_lean_burn],
+                G=self._sac_flight["G"][is_lean_burn],
+                particles=self.params["particles_lean_burn"],
+            )
+
             min_aei = None  # don't clip
 
         else:
@@ -1039,7 +1049,7 @@ class Cocip(Model):
                 wingspan,
                 true_airspeed,
                 fuel_flow,
-                nvpm_ei_n,
+                aei,
                 0.5 * depth,  # Taking the mid-point of the contrail plume
             )
         else:
@@ -1115,8 +1125,11 @@ class Cocip(Model):
             self._downwash_contrail,
             self.params["effective_vertical_resolution"],
             self.params["wind_shear_enhancement_exponent"],
+            self.params["turbulent_vertical_velocity_scale"],
             self.params["sedimentation_impact_factor"],
             self.params["radiative_heating_effects"],
+            self.params["max_horizontal_diffusivity"],
+            self.params["max_vertical_diffusivity"],
         )
 
         # Intersect with rad dataset
@@ -1189,8 +1202,11 @@ class Cocip(Model):
                 latest_contrail,
                 self.params["effective_vertical_resolution"],
                 self.params["wind_shear_enhancement_exponent"],
+                self.params["turbulent_vertical_velocity_scale"],
                 self.params["sedimentation_impact_factor"],
                 self.params["radiative_heating_effects"],
+                self.params["max_horizontal_diffusivity"],
+                self.params["max_vertical_diffusivity"],
             )
 
             final_contrail = calc_timestep_contrail_evolution(
@@ -1364,28 +1380,24 @@ class Cocip(Model):
             self._downwash_contrail._invalidate_indices()
 
     def _bundle_results(self) -> None:
-        # ---
+        verbose_outputs = self.params["verbose_outputs"]
+        compute_atr20 = self.params["compute_atr20"]
+
         # Create contrail dataframe (self.contrail)
-        # ---
         self.contrail = GeoVectorDataset.sum(self.contrail_list).dataframe
         self.contrail["timestep"] = np.concatenate(
             [np.full(c.size, i) for i, c in enumerate(self.contrail_list)]
         )
-
-        # add age in hours to the contrail waypoint outputs
         age_hours = np.empty_like(self.contrail["ef"])
         np.divide(self.contrail["age"], np.timedelta64(1, "h"), out=age_hours)
         self.contrail["age_hours"] = age_hours
 
-        verbose_outputs = self.params["verbose_outputs"]
         if verbose_outputs:
-            # Compute dt_integration -- logic is somewhat complicated, but
-            # we're simply addressing that the first dt_integration
-            # is different from the rest
-
-            # We call reset_index to introduces an `index` RangeIndex column,
-            # Which we use in the `groupby` to identify the
-            # index of the first evolution step at each waypoint.
+            # Logic is somewhat complicated: we're addressing that the first
+            # dt_integration is different from the rest
+            # We call reset_index to introduce an index RangeIndex column,
+            # which we use in the groupby to identify the index of the
+            # first evolution step at each waypoint.
             tmp = self.contrail.reset_index()
             cols = ["formation_time", "time", "index"]
             first_form_time = tmp.groupby("waypoint")[cols].first()
@@ -1396,15 +1408,6 @@ class Cocip(Model):
             self.contrail["dt_integration"] = first_dt
             self.contrail.fillna({"dt_integration": self.params["dt_integration"]}, inplace=True)
 
-            # ---
-            # Create contrail xr.Dataset (self.contrail_dataset)
-            # ---
-            if isinstance(self.source, Fleet):
-                keys = ["flight_id", "timestep", "waypoint"]
-            else:
-                keys = ["timestep", "waypoint"]
-            self.contrail_dataset = xr.Dataset.from_dataframe(self.contrail.set_index(keys))
-
         # ---
         # Create output Flight / Fleet (self.source)
         # ---
@@ -1412,7 +1415,7 @@ class Cocip(Model):
         col_idx = ["flight_id", "waypoint"] if isinstance(self.source, Fleet) else ["waypoint"]
         del self.source["_met_intersection"]
 
-        # Attach intermediate calculations from `sac_flight` and `downwash_flight` to flight
+        # SAC columns to attach from _sac_flight
         sac_cols = [
             "width",
             "depth",
@@ -1422,18 +1425,13 @@ class Cocip(Model):
             "altitude_1",
             "persistent_1",
         ]
-
-        # add additional columns
         if verbose_outputs:
             sac_cols += ["dT_dz", "ds_dz", "dz_max"]
 
-        downwash_cols = [
-            "rho_air_1",
-            "iwc_1",
-            "f_surv",
-            "n_ice_per_m_0",
-            "n_ice_per_m_1",
-        ]
+        # Downwash columns to attach from _downwash_flight
+        downwash_cols = ["rho_air_1", "iwc_1", "f_surv", "n_ice_per_m_0", "n_ice_per_m_1"]
+
+        # Combine source with sac and downwash data
         df = pd.concat(
             [
                 self.source.dataframe.set_index(col_idx),
@@ -1446,63 +1444,65 @@ class Cocip(Model):
         # Aggregate contrail data back to flight
         grouped = self.contrail.groupby(col_idx)
 
-        # Perform all aggregations
+        # Build aggregation dict for contrail -> source aggregation
         agg_dict = {"ef": ["sum"], "age": ["max"]}
-        if self.params["compute_atr20"]:
+        if compute_atr20:
             agg_dict["global_yearly_mean_rf"] = ["sum"]
             agg_dict["atr20"] = ["sum"]
 
+        # Radiative forcing columns: always include mean, optionally min/max
         rad_keys = ["sdr", "rsr", "olr", "rf_sw", "rf_lw", "rf_net"]
         for key in rad_keys:
-            if verbose_outputs:
-                agg_dict[key] = ["mean", "min", "max"]
-            else:
-                agg_dict[key] = ["mean"]
+            agg_dict[key] = ["mean", "min", "max"] if verbose_outputs else ["mean"]
 
         aggregated = grouped.agg(agg_dict)
         aggregated.columns = [f"{k1}_{k2}" for k1, k2 in aggregated.columns]
-        aggregated = aggregated.rename(columns={"ef_sum": "ef", "age_max": "contrail_age"})
-        if self.params["compute_atr20"]:
-            aggregated = aggregated.rename(
-                columns={"global_yearly_mean_rf_sum": "global_yearly_mean_rf", "atr20_sum": "atr20"}
-            )
 
-        # Join the two
+        # Rename aggregated columns to standard names
+        rename_cols = {"ef_sum": "ef", "age_max": "contrail_age"}
+        if compute_atr20:
+            rename_cols["global_yearly_mean_rf_sum"] = "global_yearly_mean_rf"
+            rename_cols["atr20_sum"] = "atr20"
+        aggregated = aggregated.rename(columns=rename_cols)
+
+        # Join aggregated contrail data to source
         df = df.join(aggregated)
 
         # Fill missing values for ef and contrail_age per conventions
-        # Mean, max, and min radiative values are *not* filled with 0
+        # Note: radiative forcing mean, max, and min values are *not* filled with 0
         df.fillna({"ef": 0.0, "contrail_age": np.timedelta64(0, "ns")}, inplace=True)
 
-        # cocip flag for each waypoint
-        # -1 if negative EF, 0 if no EF, 1 if positive EF,
-        # or NaN for outside of domain of flight waypoints that don't persist
+        # Cocip flag for each waypoint:
+        # -1 if negative EF, 0 if no EF, 1 if positive EF, NaN for waypoints outside met domain
         df["cocip"] = np.sign(df["ef"])
         logger.debug("Total number of waypoints with nonzero EF: %s", df["cocip"].ne(0.0).sum())
 
-        # reset the index
+        # Reset index and reassign to source (without creating a new instance)
         df = df.reset_index()
-
-        # Reassign to source
         self.source.data = VectorDataDict({k: v.to_numpy() for k, v in df.items()})
 
     def _fill_empty_flight_results(self, return_list_flight: bool) -> Flight | list[Flight]:
         """Fill empty results into flight / fleet and return.
 
-        This method attaches an all nan array to each of the variables:
-            - sdr
-            - rsr
-            - olr
-            - rf_sw
-            - rf_lw
-            - rf_net
+        This method creates an empty :attr:`contrail` DataFrame with the standard columns
+        and attaches standard output columns to :attr:`source`.
 
-        This method also attaches zeros (for trajectory points contained within met grid)
-        or nans (for trajectory points outside of the met grid) to the following variables.
-            - ef
-            - cocip
-            - contrail_age
-            - persistent_1
+        The following columns are added to :attr:`source` with nan values:
+            - sdr_mean, rsr_mean, olr_mean, rf_sw_mean, rf_lw_mean, rf_net_mean
+            - width, depth, rhi_1, air_temperature_1, specific_humidity_1, altitude_1
+            - rho_air_1, iwc_1, f_surv, n_ice_per_m_0, n_ice_per_m_1
+
+        The following columns are added with zeros (for waypoints within met grid)
+        or nans (for waypoints outside the met grid):
+            - ef, cocip, contrail_age, persistent_1
+
+        When ``verbose_outputs=True``, additional columns are added:
+            - dT_dz, ds_dz, dz_max (to source)
+            - sdr_min, sdr_max, rsr_min, rsr_max, olr_min, olr_max,
+              rf_sw_min, rf_sw_max, rf_lw_min, rf_lw_max, rf_net_min, rf_net_max (to source)
+
+        When ``compute_atr20=True``, additional columns are added:
+            - global_yearly_mean_rf, atr20 (to source and contrail)
 
         Parameters
         ----------
@@ -1517,18 +1517,147 @@ class Cocip(Model):
         """
         self._cleanup_indices()
 
+        verbose_outputs = self.params["verbose_outputs"]
+        compute_atr20 = self.params["compute_atr20"]
+
         intersection = self.source.data.pop("_met_intersection")
         zeros_and_nans = np.zeros(intersection.shape, dtype=np.float32)
         zeros_and_nans[~intersection] = np.nan
+        nan_array = np.full(intersection.shape, np.nan, dtype=np.float32)
+
+        # Columns with zeros (inside met) or nans (outside met)
         self.source["ef"] = zeros_and_nans.copy()
         self.source["persistent_1"] = zeros_and_nans.copy()
         self.source["cocip"] = np.sign(zeros_and_nans)
         self.source["contrail_age"] = zeros_and_nans.astype("timedelta64[ns]")
 
+        # SAC columns (nan-filled)
+        sac_cols = [
+            "width",
+            "depth",
+            "rhi_1",
+            "air_temperature_1",
+            "specific_humidity_1",
+            "altitude_1",
+        ]
+        for col in sac_cols:
+            if col not in self.source:
+                self.source[col] = nan_array.copy()
+
+        # Downwash columns (nan-filled)
+        downwash_cols = ["rho_air_1", "iwc_1", "f_surv", "n_ice_per_m_0", "n_ice_per_m_1"]
+        for col in downwash_cols:
+            if col not in self.source:
+                self.source[col] = nan_array.copy()
+
+        # Radiative forcing aggregation columns (nan-filled)
+        rad_keys = ["sdr", "rsr", "olr", "rf_sw", "rf_lw", "rf_net"]
+        for key in rad_keys:
+            self.source[f"{key}_mean"] = nan_array.copy()
+            if verbose_outputs:
+                self.source[f"{key}_min"] = nan_array.copy()
+                self.source[f"{key}_max"] = nan_array.copy()
+
+        # Verbose output columns (nan-filled)
+        if verbose_outputs:
+            verbose_cols = ["dT_dz", "ds_dz", "dz_max"]
+            for col in verbose_cols:
+                if col not in self.source:
+                    self.source[col] = nan_array.copy()
+
+        # ATR20 columns (nan-filled)
+        if compute_atr20:
+            self.source["global_yearly_mean_rf"] = nan_array.copy()
+            self.source["atr20"] = nan_array.copy()
+
+        # Create empty contrail DataFrame with standard columns
+        self.contrail = self._create_empty_contrail_dataframe()
+
         if return_list_flight:
             return self.source.to_flight_list()  # type: ignore[attr-defined]
 
         return self.source
+
+    def _create_empty_contrail_dataframe(self) -> pd.DataFrame:
+        """Create an empty contrail DataFrame with the standard columns and dtypes.
+
+        Returns
+        -------
+        pd.DataFrame
+            Empty DataFrame with standard contrail columns.
+        """
+        # Define column dtypes for the contrail DataFrame
+        # These match the columns produced by _bundle_results when contrails exist
+        col_dtypes = {
+            "waypoint": np.int64,
+            "flight_id": str,
+            "formation_time": "datetime64[ns]",
+            "time": "datetime64[ns]",
+            "age": "timedelta64[ns]",
+            "longitude": np.float32,
+            "latitude": np.float32,
+            "altitude": np.float32,
+            "level": np.float32,
+            "continuous": bool,
+            "segment_length": np.float32,
+            "sin_a": np.float32,
+            "cos_a": np.float32,
+            "width": np.float32,
+            "depth": np.float32,
+            "sigma_yz": np.float32,
+            "air_temperature": np.float32,
+            "specific_humidity": np.float32,
+            "air_pressure": np.float32,
+            "rhi": np.float32,
+            "rho_air": np.float32,
+            "q_sat": np.float32,
+            "n_ice_per_m": np.float32,
+            "iwc": np.float32,
+            "u_wind": np.float32,
+            "v_wind": np.float32,
+            "vertical_velocity": np.float32,
+            "tau_cirrus": np.float32,
+            "air_temperature_lower": np.float32,
+            "u_wind_lower": np.float32,
+            "v_wind_lower": np.float32,
+            "dT_dz": np.float32,
+            "ds_dz": np.float32,
+            "dsn_dz": np.float32,
+            "sdr": np.float32,
+            "top_net_solar_radiation": np.float32,
+            "rsr": np.float32,
+            "top_net_thermal_radiation": np.float32,
+            "olr": np.float32,
+            "area_eff": np.float32,
+            "plume_mass_per_m": np.float32,
+            "r_ice_vol": np.float32,
+            "terminal_fall_speed": np.float32,
+            "diffuse_h": np.float32,
+            "diffuse_v": np.float32,
+            "n_ice_per_vol": np.float32,
+            "tau_contrail": np.float32,
+            "dn_dt_agg": np.float32,
+            "dn_dt_turb": np.float32,
+            "rf_sw": np.float32,
+            "rf_lw": np.float32,
+            "rf_net": np.float32,
+            "persistent": bool,
+            "ef": np.float32,
+            "timestep": np.int64,
+            "age_hours": np.float32,
+        }
+
+        # Add verbose output columns
+        if self.params["verbose_outputs"]:
+            col_dtypes["dt_integration"] = "timedelta64[ns]"
+
+        # Add ATR20 columns
+        if self.params["compute_atr20"]:
+            col_dtypes["global_yearly_mean_rf"] = np.float32
+            col_dtypes["atr20"] = np.float32
+
+        # Create empty DataFrame with proper dtypes
+        return pd.DataFrame({col: np.array([], dtype=dtype) for col, dtype in col_dtypes.items()})  # type: ignore[call-overload]
 
 
 # ----------------------------------------
@@ -1672,7 +1801,7 @@ def _process_rad(rad: MetDataset) -> MetDataset:
                 "HRES data must have a boolean 'radiation_accumulated' attribute. "
                 "This attribute is used to determine whether the radiation data "
                 "has been accumulated over the time period. This is the case for "
-                "HRES data taken from a common time of forecast with multiple "
+                "HRES data taken from a common forecast reference time with multiple "
                 "forecast steps. If this is not the case, set the "
                 "'radiation_accumulated' attribute to False."
             )
@@ -2160,9 +2289,6 @@ def calc_radiative_properties(contrail: GeoVectorDataset, params: dict[str, Any]
     time = contrail["time"]
     air_temperature = contrail["air_temperature"]
 
-    if params["radiative_heating_effects"]:
-        air_temperature += contrail["cumul_heat"]
-
     r_ice_vol = contrail["r_ice_vol"]
     tau_contrail = contrail["tau_contrail"]
     tau_cirrus_ = contrail["tau_cirrus"]
@@ -2181,12 +2307,20 @@ def calc_radiative_properties(contrail: GeoVectorDataset, params: dict[str, Any]
     habit_weights = radiative_forcing.habit_weights(
         r_vol_um, params["habit_distributions"], params["radius_threshold_um"]
     )
-    rf_lw = radiative_forcing.longwave_radiative_forcing(
-        r_vol_um, olr, air_temperature, tau_contrail, tau_cirrus_, habit_weights
-    )
-    rf_sw = radiative_forcing.shortwave_radiative_forcing(
-        r_vol_um, sdr, rsr, sd0, tau_contrail, tau_cirrus_, habit_weights
-    )
+    if params["parametric_rf_model_s2025"]:
+        rf_lw = radiative_forcing.longwave_radiative_forcing_s2025(
+            r_vol_um, olr, air_temperature, tau_contrail, tau_cirrus_, habit_weights
+        )
+        rf_sw = radiative_forcing.shortwave_radiative_forcing_s2025(
+            r_vol_um, sdr, rsr, sd0, tau_contrail, tau_cirrus_, habit_weights
+        )
+    else:
+        rf_lw = radiative_forcing.longwave_radiative_forcing(
+            r_vol_um, olr, air_temperature, tau_contrail, tau_cirrus_, habit_weights
+        )
+        rf_sw = radiative_forcing.shortwave_radiative_forcing(
+            r_vol_um, sdr, rsr, sd0, tau_contrail, tau_cirrus_, habit_weights
+        )
 
     # scale RF by enhancement factors
     rf_lw_scaled = rf_lw * params["rf_lw_enhancement_factor"]
@@ -2203,8 +2337,11 @@ def calc_contrail_properties(
     contrail: GeoVectorDataset,
     effective_vertical_resolution: float | npt.NDArray[np.floating],
     wind_shear_enhancement_exponent: float | npt.NDArray[np.floating],
+    turbulent_vertical_velocity_scale: float | npt.NDArray[np.floating],
     sedimentation_impact_factor: float | npt.NDArray[np.floating],
     radiative_heating_effects: bool,
+    max_horizontal_diffusivity: float | None,
+    max_vertical_diffusivity: float | None,
 ) -> None:
     """Calculate geometric and ice-related properties of contrail.
 
@@ -2234,10 +2371,18 @@ def calc_contrail_properties(
         Passed into :func:`wind_shear.wind_shear_enhancement_factor`.
     wind_shear_enhancement_exponent : float | npt.NDArray[np.floating]
         Passed into :func:`wind_shear.wind_shear_enhancement_factor`.
+    turbulent_vertical_velocity_scale: float | npt.NDArray[np.floating]
+        Passed into `contrail_properties.vertical_diffusivity`.
     sedimentation_impact_factor: float | npt.NDArray[np.floating]
         Passed into `contrail_properties.vertical_diffusivity`.
     radiative_heating_effects: bool
         Include radiative heating effects on contrail cirrus properties.
+    max_horizontal_diffusivity: float | None
+        Constrain max horizontal diffusivity to prevent unrealistic values, [:math:`m^{2} s^{-1}`]
+        If None is passed, the maximum vertical diffusivity will not be constrained.
+    max_vertical_diffusivity: float | None
+        Constrain max vertical diffusivity to prevent unrealistic values, [:math:`m^{2} s^{-1}`]
+        If None is passed, the maximum vertical diffusivity will not be constrained.
     """
     time = contrail["time"]
     iwc = contrail["iwc"]
@@ -2255,9 +2400,6 @@ def calc_contrail_properties(
     ds_dz = contrail["ds_dz"]
     dsn_dz = contrail["dsn_dz"]
     sigma_yz = contrail["sigma_yz"]
-
-    if radiative_heating_effects:
-        air_temperature += contrail["cumul_heat"]
 
     # get required radiation
     sdr = contrail["sdr"]
@@ -2291,7 +2433,11 @@ def calc_contrail_properties(
     terminal_fall_speed = contrail_properties.ice_particle_terminal_fall_speed(
         air_pressure, air_temperature, r_ice_vol
     )
-    diffuse_h = contrail_properties.horizontal_diffusivity(ds_dz, depth)
+    diffuse_h = contrail_properties.horizontal_diffusivity(
+        ds_dz,
+        depth,
+        max_horizontal_diffusivity,
+    )
 
     if radiative_heating_effects:
         # theta_rad has float64 dtype, convert back to float32 if needed
@@ -2338,8 +2484,10 @@ def calc_contrail_properties(
         dT_dz=dT_dz,
         depth_eff=depth_eff,
         terminal_fall_speed=terminal_fall_speed,
+        turbulent_vertical_velocity_scale=turbulent_vertical_velocity_scale,
         sedimentation_impact_factor=sedimentation_impact_factor,
         eff_heat_rate=eff_heat_rate,
+        max_vertical_diffusivity=max_vertical_diffusivity,
     )
 
     dn_dt_agg = contrail_properties.particle_losses_aggregation(
@@ -2470,16 +2618,16 @@ def calc_timestep_contrail_evolution(
     # Update cumulative radiative heating energy absorbed by the contrail
     # This will always be zero if radiative_heating_effects is not activated in cocip_params
     if params["radiative_heating_effects"]:
-        dt_sec = dt / np.timedelta64(1, "s")
         heat_rate_1 = contrail_1["heat_rate"]
         cumul_heat = contrail_1["cumul_heat"]
-        cumul_heat += heat_rate_1 * dt_sec
+        dt_sec = (dt / np.timedelta64(1, "s")).astype(cumul_heat.dtype, copy=False)
+        cumul_heat = cumul_heat + heat_rate_1 * dt_sec  # avoid += (may be read-only)
         cumul_heat.clip(max=1.5, out=cumul_heat)  # Constrain additional heat to 1.5 K as precaution
         contrail_2["cumul_heat"] = cumul_heat
 
         d_heat_rate_1 = contrail_1["d_heat_rate"]
         cumul_differential_heat = contrail_1["cumul_differential_heat"]
-        cumul_differential_heat += -d_heat_rate_1 * dt_sec
+        cumul_differential_heat = cumul_differential_heat - d_heat_rate_1 * dt_sec  # avoid +=
         contrail_2["cumul_differential_heat"] = cumul_differential_heat
 
     # Attach a few more artifacts for disabled filtering
@@ -2521,7 +2669,8 @@ def calc_timestep_contrail_evolution(
     air_temperature_2 = interpolate_met(met, contrail_2, "air_temperature", **interp_kwargs)
 
     if params["radiative_heating_effects"]:
-        air_temperature_2 += contrail_2["cumul_heat"]
+        air_temperature_2 = air_temperature_2 + contrail_2["cumul_heat"]
+        contrail_2.update(air_temperature=air_temperature_2)
 
     interpolate_met(met, contrail_2, "specific_humidity", **interp_kwargs)
 
@@ -2543,20 +2692,87 @@ def calc_timestep_contrail_evolution(
     contrail_2["rho_air"] = rho_air_2
     contrail_2["q_sat"] = q_sat_2
 
-    # New contrail ice particle mass and number
+    # calculate new contrail ice particle mass ...
     area_eff_2 = contrail_properties.new_effective_area_from_sigma(
         sigma_yy_2, sigma_zz_2, sigma_yz_2
     )
     plume_mass_per_m_2 = contrail_properties.plume_mass_per_distance(area_eff_2, rho_air_2)
-    iwc_2 = contrail_properties.new_ice_water_content(
-        iwc_1,
-        specific_humidity_1,
-        specific_humidity_2,
-        q_sat_1,
-        q_sat_2,
-        plume_mass_per_m_1,
-        plume_mass_per_m_2,
-    )
+
+    # ... using revised ice budget ...
+    if params["revised_contrail_ice_budget"]:
+        # compute ambient specific humidity and saturation specific humidity after sedimentation
+        level_sed = geo.advect_level(level_1, 0.0, rho_air_1, terminal_fall_speed_1, dt)
+        contrail_sed = GeoVectorDataset._from_fastpath(
+            {
+                "time": time_1,
+                "longitude": longitude_1,
+                "latitude": latitude_1,
+                "level": level_sed,
+            }
+        )
+        interpolate_met(met, contrail_sed, "air_temperature", **interp_kwargs)
+        interpolate_met(met, contrail_sed, "specific_humidity", **interp_kwargs)
+        if humidity_scaling is not None:
+            humidity_scaling.eval(contrail_sed, copy_source=False)
+        else:
+            contrail_sed["air_pressure"] = contrail_sed.air_pressure
+
+        specific_humidity_sed = contrail_sed["specific_humidity"]
+        q_sat_sed = thermo.q_sat_ice(contrail_sed["air_temperature"], contrail_sed["air_pressure"])
+
+        # compute plume mass after sedimentation
+        plume_mass_per_m_sed = contrail_properties.plume_mass_per_distance(
+            contrail_1["area_eff"],
+            thermo.rho_d(contrail_sed["air_temperature"], contrail_sed["air_pressure"]),
+        )
+
+        # compute plume depth and ice crystal phase relaxation rate
+        # used to limit deposition/subplimation in a shallow but rapidly-sedimenting plume
+        depth_eff_1 = contrail_properties.plume_effective_depth(width_1, contrail_1["area_eff"])
+        n_ice_per_vol_1 = contrail_properties.ice_particle_number_per_volume_of_plume(
+            n_ice_per_m_1, contrail_1["area_eff"]
+        )
+        n_ice_per_kg_1 = contrail_properties.ice_particle_number_per_mass_of_air(
+            n_ice_per_vol_1, rho_air_1
+        )
+        r_vol_1 = contrail_properties.ice_particle_volume_mean_radius(iwc_1, n_ice_per_kg_1)
+        vapor_diffusivity_1 = thermo.diffusivity_water_vapor(
+            contrail_1["air_temperature"], contrail_1["air_pressure"]
+        )
+        phase_relax_rate_1 = contrail_properties.phase_relaxation_rate(
+            r_vol_1, n_ice_per_vol_1, vapor_diffusivity_1
+        )
+
+        iwc_2 = contrail_properties.new_ice_water_content_revised(
+            iwc_1,
+            specific_humidity_1,
+            specific_humidity_sed,
+            specific_humidity_2,
+            q_sat_1,
+            q_sat_sed,
+            q_sat_2,
+            plume_mass_per_m_1,
+            plume_mass_per_m_sed,
+            plume_mass_per_m_2,
+            depth_eff_1,
+            terminal_fall_speed_1,
+            phase_relax_rate_1,
+            dt,
+        )
+
+    # ... or original ice budget
+    else:
+        iwc_2 = contrail_properties.new_ice_water_content(
+            iwc_1,
+            specific_humidity_1,
+            specific_humidity_2,
+            q_sat_1,
+            q_sat_2,
+            plume_mass_per_m_1,
+            plume_mass_per_m_2,
+        )
+
+    # calculate new contrail ice particle number
     n_ice_per_m_2 = contrail_properties.new_ice_particle_number(
         n_ice_per_m_1, dn_dt_agg_1, dn_dt_turb_1, seg_ratio_2, dt
     )
@@ -2574,8 +2790,11 @@ def calc_timestep_contrail_evolution(
         contrail_2,
         params["effective_vertical_resolution"],
         params["wind_shear_enhancement_exponent"],
+        params["turbulent_vertical_velocity_scale"],
         params["sedimentation_impact_factor"],
         params["radiative_heating_effects"],
+        params["max_horizontal_diffusivity"],
+        params["max_vertical_diffusivity"],
     )
     calc_radiative_properties(contrail_2, params)
 
@@ -2752,6 +2971,7 @@ def _contrail_contrail_overlapping(
         min_altitude_m=params["min_altitude_m"],
         max_altitude_m=params["max_altitude_m"],
         dz_overlap_m=params["dz_overlap_m"],
+        rf_model_s2025=params["parametric_rf_model_s2025"],
     )
 
     contrail.update(

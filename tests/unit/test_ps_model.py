@@ -107,8 +107,7 @@ def test_ps_model() -> None:
     dv_dt = np.array([0.0, 0.0])
 
     # Extract aircraft properties for aircraft type
-    ps_model = ps.PSFlight(params={"engine_deterioration_factor": 0.0})
-    atyp_param = ps_model.aircraft_engine_params[aircraft_type_icao]
+    atyp_param = ps.load_aircraft_engine_params()[aircraft_type_icao]
 
     # Test Reynolds Number
     rn = ps.reynolds_number(
@@ -172,7 +171,13 @@ def test_ps_model() -> None:
     np.testing.assert_array_almost_equal(c_t_eta_b, [0.0347, 0.0347], decimal=2)
 
     # Test overall propulsion efficiency
-    engine_efficiency = ps.overall_propulsion_efficiency(mach_number, c_t, c_t_eta_b, atyp_param)
+    engine_efficiency = ps.overall_propulsion_efficiency(
+        mach_number,
+        c_t,
+        c_t_eta_b,
+        atyp_param,
+        engine_deterioration_factor=0.0,
+    )
     np.testing.assert_array_almost_equal(engine_efficiency, [0.3046, 0.3053], decimal=3)
 
     # Test fuel mass flow rate
@@ -224,7 +229,7 @@ def test_mach_number_limits_scalar() -> None:
     )
 
     np.testing.assert_array_almost_equal(
-        mmax, [0.645, 0.703, 0.770, 0.84, 0.84, 0.84, 0.84], decimal=3
+        mmax, [0.624, 0.683, 0.749, 0.82, 0.82, 0.82, 0.82], decimal=3
     )
 
 
@@ -264,7 +269,7 @@ def test_mach_number_limits_vector() -> None:
     )
 
     np.testing.assert_array_almost_equal(
-        mmax, [0.645, 0.703, 0.770, 0.84, 0.84, 0.84, 0.84], decimal=3
+        mmax, [0.624, 0.683, 0.749, 0.82, 0.82, 0.82, 0.82], decimal=3
     )
 
 
@@ -392,8 +397,7 @@ def test_normalised_aircraft_performance_curves() -> None:
     air_pressure = units.ft_to_pl(altitude_ft) * 100.0
 
     # Extract aircraft properties for aircraft type
-    ps_model = ps.PSFlight()
-    atyp_param = ps_model.aircraft_engine_params[aircraft_type_icao]
+    atyp_param = ps.load_aircraft_engine_params()[aircraft_type_icao]
     mach_num_design_opt = atyp_param.m_des
 
     # Derived coefficients
@@ -405,7 +409,13 @@ def test_normalised_aircraft_performance_curves() -> None:
     )
     c_t_over_c_t_eta_b = c_t / c_t_eta_b
 
-    eta = ps.overall_propulsion_efficiency(mach_num, c_t, c_t_eta_b, atyp_param)
+    eta = ps.overall_propulsion_efficiency(
+        mach_num,
+        c_t,
+        c_t_eta_b,
+        atyp_param,
+        engine_deterioration_factor=0.025,  # default value previously used in PSFlight
+    )
     eta_b = ps.max_overall_propulsion_efficiency(
         mach_num_design_opt, mach_num_design_opt, atyp_param.eta_1, atyp_param.eta_2
     )
@@ -418,29 +428,29 @@ def test_normalised_aircraft_performance_curves() -> None:
     assert c_t_over_c_t_eta_b[i_max] < 1.01
 
 
-@pytest.mark.parametrize("load_factor", [0.5, 0.6, 0.7, 0.8])
-def test_total_fuel_burn(load_factor: float) -> None:
-    """Check pinned total fuel burn values for different load factors."""
+@pytest.mark.parametrize("payload", [6000, 9000, 12000, 15000])
+def test_total_fuel_burn(payload: float) -> None:
+    """Check pinned total fuel burn values for different custom payloads."""
     df_flight = pd.read_csv(get_static_path("flight.csv"))
 
-    attrs = {"flight_id": "1", "aircraft_type": "A320", "load_factor": load_factor}
+    attrs = {"flight_id": "1", "aircraft_type": "A320", "payload": payload}
     flight = Flight(df_flight.iloc[:100], attrs=attrs)
 
     flight["air_temperature"] = flight.T_isa()
     flight["true_airspeed"] = units.knots_to_m_per_s(flight["speed"])
 
     # Aircraft performance model
-    ps_model = ps.PSFlight()
+    ps_model = ps.PSFlight(max_mach_buffer=0.02)  # using old buffer value to match pinned values
     out = ps_model.eval(flight)
 
-    if load_factor == 0.5:
-        assert out.attrs["total_fuel_burn"] == pytest.approx(5039, abs=1.0)
-    elif load_factor == 0.6:
-        assert out.attrs["total_fuel_burn"] == pytest.approx(5335, abs=1.0)
-    elif load_factor == 0.7:
-        assert out.attrs["total_fuel_burn"] == pytest.approx(5463, abs=1.0)
-    elif load_factor == 0.8:
-        assert out.attrs["total_fuel_burn"] == pytest.approx(5583, abs=1.0)
+    if payload == 6000:
+        assert out.attrs["total_fuel_burn"] == pytest.approx(4588, abs=1.0)
+    elif payload == 9000:
+        assert out.attrs["total_fuel_burn"] == pytest.approx(5122, abs=1.0)
+    elif payload == 12000:
+        assert out.attrs["total_fuel_burn"] == pytest.approx(5424, abs=1.0)
+    elif payload == 15000:
+        assert out.attrs["total_fuel_burn"] == pytest.approx(5601, abs=1.0)
     else:
         pytest.fail("Unexpected load factor")
 
@@ -503,7 +513,7 @@ def test_ps_optimal_mach() -> None:
     )
 
     np.testing.assert_array_almost_equal(
-        mach_opt["mach_number"].values, [0.645, 0.703, 0.77, 0.804, 0.81, 0.807, 0.795], decimal=3
+        mach_opt["mach_number"].values, [0.624, 0.683, 0.749, 0.804, 0.81, 0.807, 0.795], decimal=3
     )
 
 
@@ -690,8 +700,8 @@ def test_ps_flight_on_fleet() -> None:
     assert out.fl_attrs[2]["aircraft_type"] == "A333"
     assert out.fl_attrs[1]["flight_id"] == 1
     assert out.fl_attrs[2]["flight_id"] == 2
-    assert out.fl_attrs[1]["aircraft_performance_model"] == "PSFlight"
-    assert out.fl_attrs[2]["aircraft_performance_model"] == "PSFlight"
+    assert out.fl_attrs[1]["aircraft_performance_model"] == "PS"
+    assert out.fl_attrs[2]["aircraft_performance_model"] == "PS"
     assert out.fl_attrs[1]["n_engine"] == 2
     assert out.fl_attrs[2]["n_engine"] == 2
     assert out.fl_attrs[1]["wingspan"] == 34.1

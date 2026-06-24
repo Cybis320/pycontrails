@@ -20,7 +20,6 @@ import pandas as pd
 
 from pycontrails.core import flight
 from pycontrails.core.aircraft_performance import (
-    DEFAULT_LOAD_FACTOR,
     AircraftPerformance,
     AircraftPerformanceData,
     AircraftPerformanceParams,
@@ -80,9 +79,7 @@ class PSFlight(AircraftPerformance):
         **params_kwargs: Any,
     ) -> None:
         super().__init__(met=met, params=params, **params_kwargs)
-        self.aircraft_engine_params = load_aircraft_engine_params(
-            self.params["engine_deterioration_factor"]
-        )
+        self.aircraft_engine_params = load_aircraft_engine_params()
         self.synonym_dict = get_aircraft_synonym_dict_ps()
 
     def check_aircraft_type_availability(
@@ -130,8 +127,10 @@ class PSFlight(AircraftPerformance):
             msg = f"Aircraft type {aircraft_type} not covered by the PS model."
             raise KeyError(msg) from exc
 
+        engine_deterioration_factor = self.get_engine_deterioration_factor(fl, aircraft_type)
+
         # Set flight attributes based on engine, if they aren't already defined
-        fl.attrs.setdefault("aircraft_performance_model", self.name)
+        fl.attrs.setdefault("aircraft_performance_model", "PS")
         fl.attrs.setdefault("aircraft_type_ps", atyp_ps)
         fl.attrs.setdefault("n_engine", aircraft_params.n_engine)
 
@@ -143,7 +142,7 @@ class PSFlight(AircraftPerformance):
         amass_oew = fl.attrs.get("amass_oew", aircraft_params.amass_oew)
         amass_mtow = fl.attrs.get("amass_mtow", aircraft_params.amass_mtow)
         amass_mpl = fl.attrs.get("amass_mpl", aircraft_params.amass_mpl)
-        load_factor = fl.attrs.get("load_factor", DEFAULT_LOAD_FACTOR)
+        payload = self.estimate_payload(fl, aircraft_type, amass_mpl)
         takeoff_mass = fl.attrs.get("takeoff_mass")
         q_fuel = fl.fuel.q_fuel
 
@@ -166,9 +165,10 @@ class PSFlight(AircraftPerformance):
             amass_oew=amass_oew,
             amass_mtow=amass_mtow,
             amass_mpl=amass_mpl,
-            load_factor=load_factor,
+            payload=payload,
             takeoff_mass=takeoff_mass,
             correct_fuel_flow=self.params["correct_fuel_flow"],
+            engine_deterioration_factor=engine_deterioration_factor,
         )
 
         # Set array aircraft_performance to flight, don't overwrite
@@ -210,6 +210,12 @@ class PSFlight(AircraftPerformance):
             msg = "A 'correct_fuel_flow' kwarg is required for this model"
             raise KeyError(msg) from exc
 
+        try:
+            engine_deterioration_factor = kwargs["engine_deterioration_factor"]
+        except KeyError as exc:
+            msg = "An 'engine_deterioration_factor' kwarg is required for this model"
+            raise KeyError(msg) from exc
+
         if not isinstance(true_airspeed, np.ndarray):
             msg = "Only array inputs are supported"
             raise NotImplementedError(msg)
@@ -227,7 +233,7 @@ class PSFlight(AircraftPerformance):
             atyp_param.p_i_max,
             atyp_param.p_inf_co,
             atm_speed_limit=False,
-            buffer=0.02,
+            buffer=self.params["max_mach_buffer"],
         )
         true_airspeed, mach_num = jet.clip_mach_number(true_airspeed, air_temperature, max_mach)
 
@@ -285,7 +291,12 @@ class PSFlight(AircraftPerformance):
 
         if engine_efficiency is None:
             engine_efficiency = overall_propulsion_efficiency(
-                mach_num, c_t, c_t_eta_b, atyp_param, self.params["eta_over_eta_b_min"]
+                mach_num,
+                c_t,
+                c_t_eta_b,
+                atyp_param,
+                engine_deterioration_factor=engine_deterioration_factor,
+                eta_over_eta_b_min=self.params["eta_over_eta_b_min"],
             )
 
         if fuel_flow is None:
@@ -302,9 +313,6 @@ class PSFlight(AircraftPerformance):
             fuel_flow = np.full_like(true_airspeed, fuel_flow)
 
         # Flight phase
-        segment_duration = flight.segment_duration(time, dtype=altitude_ft.dtype)
-        rocd = flight.segment_rocd(segment_duration, altitude_ft, air_temperature)
-
         if correct_fuel_flow:
             flight_phase = flight.segment_phase(rocd, altitude_ft)
             fuel_flow = fuel_flow_correction(
@@ -596,15 +604,12 @@ def wave_drag_coefficient(
     m_cc = atyp_param.wing_constant - 0.10 * (c_lift / atyp_param.cos_sweep**2)
     x = mach_num * atyp_param.cos_sweep / m_cc
 
-    c_d_w = np.where(
-        x < atyp_param.j_2,
-        0.0,
-        atyp_param.cos_sweep**3 * atyp_param.j_1 * (x - atyp_param.j_2) ** 2,
-    )
+    dx_j2 = np.maximum(x - atyp_param.j_2, np.float32(0.0))
+    c_d_w = atyp_param.cos_sweep**3 * atyp_param.j_1 * dx_j2 * dx_j2
 
-    return np.where(  # type: ignore[return-value]
-        x < atyp_param.x_ref, c_d_w, c_d_w + atyp_param.j_3 * (x - atyp_param.x_ref) ** 4
-    )
+    dx_ref = np.maximum(x - atyp_param.x_ref, np.float32(0.0))
+    d_ref_4 = (dx_ref**2) ** 2  # avoid **4 for performance
+    return c_d_w + atyp_param.j_3 * d_ref_4
 
 
 def airframe_drag_coefficient(
@@ -708,11 +713,8 @@ def thrust_force(
     Eq. (95) of :cite:`pollEstimationMethodFuel2021a`.
     """
     theta = units.degrees_to_radians(theta)
-    f_thrust = (
-        (aircraft_mass * constants.g * np.cos(theta) * (c_d / c_l))
-        + (aircraft_mass * constants.g * np.sin(theta))
-        + aircraft_mass * dv_dt
-    )
+    mg = aircraft_mass * constants.g
+    f_thrust = (mg * np.cos(theta) * (c_d / c_l)) + (mg * np.sin(theta)) + aircraft_mass * dv_dt
     return f_thrust.clip(min=0.0)
 
 
@@ -748,6 +750,7 @@ def overall_propulsion_efficiency(
     c_t: ArrayOrFloat,
     c_t_eta_b: ArrayOrFloat,
     atyp_param: PSAircraftEngineParams,
+    engine_deterioration_factor: float,
     eta_over_eta_b_min: float | None = None,
 ) -> npt.NDArray[np.floating]:
     """Calculate overall propulsion efficiency.
@@ -762,6 +765,8 @@ def overall_propulsion_efficiency(
         Thrust coefficient at maximum overall propulsion efficiency for a given Mach Number.
     atyp_param : PSAircraftEngineParams
         Extracted aircraft and engine parameters.
+    engine_deterioration_factor : float, optional
+        Factor to account for engine deterioration.
     eta_over_eta_b_min : float | None, optional
         Clip the ratio of the overall propulsion efficiency to the maximum propulsion
         efficiency to this value. See :func:`propulsion_efficiency_over_max_propulsion_efficiency`.
@@ -775,9 +780,9 @@ def overall_propulsion_efficiency(
     eta_over_eta_b = propulsion_efficiency_over_max_propulsion_efficiency(mach_num, c_t, c_t_eta_b)
     if eta_over_eta_b_min is not None:
         eta_over_eta_b.clip(min=eta_over_eta_b_min, out=eta_over_eta_b)
-    eta_b = max_overall_propulsion_efficiency(
-        mach_num, atyp_param.m_des, atyp_param.eta_1, atyp_param.eta_2
-    )
+
+    eta_1 = atyp_param.eta_1 / (1.0 + engine_deterioration_factor)
+    eta_b = max_overall_propulsion_efficiency(mach_num, atyp_param.m_des, eta_1, atyp_param.eta_2)
     return eta_over_eta_b * eta_b
 
 
@@ -807,23 +812,45 @@ def propulsion_efficiency_over_max_propulsion_efficiency(
     - ``eta / eta_b`` is approximated using a fourth-order polynomial
     - ``eta_b`` is the maximum overall propulsion efficiency for a given Mach number
     """
-    c_t_over_c_t_eta_b = c_t / c_t_eta_b
+    x = c_t / c_t_eta_b
 
-    sigma = np.where(mach_num < 0.4, 1.3 * (0.4 - mach_num), np.float32(0.0))  # avoid promotion
+    # Fast path: for Mach >= 0.4, sigma=0 => s=-0.43, p=0
+    s = -0.43
+    a1 = 10.0 * (1.0 + 0.8 * s)
+    a2 = 33.3333 * (-1.0 - 0.97 * s)
+    a3 = 37.037 * (1.0 + s)
+    b0 = 1.0 + s
+    b1 = -2.0 * s
+    b2 = s
 
-    eta_over_eta_b_low = (
-        10.0 * (1.0 + 0.8 * (sigma - 0.43) - 0.6027 * sigma * 0.43) * c_t_over_c_t_eta_b
-        + 33.3333 * (-1.0 - 0.97 * (sigma - 0.43) + 0.8281 * sigma * 0.43) * (c_t_over_c_t_eta_b**2)
-        + 37.037 * (1.0 + (sigma - 0.43) - 0.9163 * sigma * 0.43) * (c_t_over_c_t_eta_b**3)
-    )
-    eta_over_eta_b_hi = (
-        (1.0 + (sigma - 0.43) - sigma * 0.43)
-        + (4.0 * sigma * 0.43 - 2.0 * (sigma - 0.43)) * c_t_over_c_t_eta_b
-        + ((sigma - 0.43) - 6 * sigma * 0.43) * (c_t_over_c_t_eta_b**2)
-        + 4.0 * sigma * 0.43 * (c_t_over_c_t_eta_b**3)
-        - sigma * 0.43 * (c_t_over_c_t_eta_b**4)
-    )
-    return np.where(c_t_over_c_t_eta_b < 0.3, eta_over_eta_b_low, eta_over_eta_b_hi)
+    eta_over_eta_b_low = x * (a1 + x * (a2 + x * a3))
+    eta_over_eta_b_hi = b0 + x * (b1 + b2 * x)
+    result = np.where(x < 0.3, eta_over_eta_b_low, eta_over_eta_b_hi)
+
+    # Slow path: when Mach < 0.4 we have nonzero sigma, which modifies the polynomial coefficients
+    low_mach = mach_num < 0.4
+    if np.any(low_mach):
+        # mypy is right, this will fail for scalar mach_num
+        sigma = 1.3 * (0.4 - mach_num[low_mach])  # type: ignore[index]
+        s = sigma - 0.43  # type: ignore[assignment]
+        p = sigma * 0.43
+        x_sub = x[low_mach]  # type: ignore[index]
+
+        a1 = 10.0 * (1.0 + 0.8 * s - 0.6027 * p)  # type: ignore[assignment]
+        a2 = 33.3333 * (-1.0 - 0.97 * s + 0.8281 * p)  # type: ignore[assignment]
+        a3 = 37.037 * (1.0 + s - 0.9163 * p)  # type: ignore[assignment]
+        eta_low = x_sub * (a1 + x_sub * (a2 + x_sub * a3))
+
+        b0 = 1.0 + s - p  # type: ignore[assignment]
+        b1 = 4.0 * p - 2.0 * s  # type: ignore[assignment]
+        b2 = s - 6.0 * p  # type: ignore[assignment]
+        b3 = 4.0 * p
+        b4 = -p
+        eta_hi = b0 + x_sub * (b1 + x_sub * (b2 + x_sub * (b3 + x_sub * b4)))
+
+        result[low_mach] = np.where(x_sub < 0.3, eta_low, eta_hi)
+
+    return result
 
 
 def thrust_coefficient_at_max_efficiency(
@@ -926,7 +953,7 @@ def fuel_mass_flow_rate(
     """
     return (
         (constants.kappa / 2)
-        * (c_t * mach_num**3 / eta)
+        * (c_t * mach_num**2 * mach_num / eta)  # avoid **3 for performance
         * (constants.kappa * constants.R_d * air_temperature) ** 0.5
         * air_pressure
         * wing_surface_area

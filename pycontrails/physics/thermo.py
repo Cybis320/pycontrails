@@ -84,7 +84,7 @@ def p_vapor(q: ArrayScalarLike, p: ArrayScalarLike) -> ArrayScalarLike:
     ArrayScalarTypeVar
         Vapor pressure, [:math:`Pa`]
     """
-    return q * p * (constants.R_v / constants.R_d)
+    return q * p / constants.epsilon
 
 
 def water_vapor_partial_pressure_along_mixing_line(
@@ -123,6 +123,47 @@ def water_vapor_partial_pressure_along_mixing_line(
     return p_wa + G * (T_plume - T_ambient)
 
 
+def diffusivity_water_vapor(T: ArrayScalarLike, p: ArrayScalarLike) -> ArrayScalarLike:
+    """
+    Calculate molecular diffusivity of water vapor.
+
+    Parameters
+    ----------
+    T: ArrayScalarLike
+        Air temperature, [:math:`K`]
+
+    p: ArrayScalarLike
+        Air pressure, [:math:`Pa`]
+
+    Returns
+    -------
+    ArrayScalarLike
+        Molecular diffusivity of water vapor, [:math:`m^2 s^{-1}`]
+
+    References
+    ----------
+    - :cite:`hallSurvivalIceParticles1976`
+    - :cite:`pruppacherMicrophysicsCloudsPrecipitation2010`
+
+    Notes
+    -----
+    The parameterization used by this function is valid for temperatures between -40 and 40 C,
+    and input temperatures are clipped to this range.
+    """
+    # FIXME: Presently, mypy is not aware that numpy ufuncs will return `xr.DataArray``
+    # when xr.DataArray is passed in. This will get fixed at some point in the future
+    # as `numpy` their typing patterns, after which the "type: ignore" comment can
+    # get ripped out.
+    # We could explicitly check for `xr.DataArray` then use `xr.apply_ufunc`, but
+    # this only renders our code more boilerplate and less performant.
+    # This comment is pasted several places in `pycontrails` -- they should all be
+    # addressed at the same time.
+    T = np.clip(T, -40.0 - constants.absolute_zero, 40.0 - constants.absolute_zero)  # type: ignore[assignment]
+    T0 = 273.15
+    p0 = 101325.0
+    return 0.0000211 * (T / T0) ** 1.94 * (p0 / p)
+
+
 # -------------------
 # Saturation Pressure
 # -------------------
@@ -143,7 +184,7 @@ def e_sat_ice(T: ArrayScalarLike) -> ArrayScalarLike:
 
     References
     ----------
-    - :cite:`sonntag1994`
+    - :cite:`sonntagAdvancementsFieldHygrometry1994`
 
     """
     # Goff Gratch equation (Smithsonian Tables, 1984)
@@ -297,9 +338,9 @@ def _e_sat_piecewise(T: np.ndarray) -> np.ndarray:
     np.ndarray
         Piecewise array of e_sat_liquid and e_sat_ice values.
     """
-    condlist = [T >= -constants.absolute_zero, T < constants.absolute_zero]  # noqa: SIM300
+    condlist = [T >= -constants.absolute_zero, T < -constants.absolute_zero]  # noqa: SIM300
     funclist = [e_sat_liquid, e_sat_ice, np.nan]  # nan passed through
-    return np.piecewise(T, condlist, funclist)
+    return np.piecewise(T, condlist, funclist)  # type: ignore[call-overload]
 
 
 # ----------------------------
@@ -399,7 +440,7 @@ def rh(q: ArrayScalarLike, T: ArrayScalarLike, p: ArrayScalarLike) -> ArrayScala
     ArrayScalarLike
         Relative Humidity, :math:`[0 - 1]`
     """
-    return (q * p * (constants.R_v / constants.R_d)) / e_sat_liquid(T)
+    return (q * p) / (constants.epsilon * e_sat_liquid(T))
 
 
 def rhi(q: ArrayScalarLike, T: ArrayScalarLike, p: ArrayScalarLike) -> ArrayScalarLike:
@@ -419,7 +460,7 @@ def rhi(q: ArrayScalarLike, T: ArrayScalarLike, p: ArrayScalarLike) -> ArrayScal
     ArrayScalarLike
         Relative Humidity over ice, :math:`[0 - 1]`
     """
-    return (q * p * (constants.R_v / constants.R_d)) / e_sat_ice(T)
+    return (q * p) / (constants.epsilon * e_sat_ice(T))
 
 
 # --------------

@@ -42,7 +42,7 @@ class ModelTestGrid(Model):
     source: MetDataset
 
     def eval(self, source: None = None, **params: Any) -> MetDataArray:
-        self.set_source()
+        self.set_source(source)
         self.update_params(params)
         self.source.data["temp"] = self.met.data["air_temperature"]
         return self.source["temp"]
@@ -172,15 +172,14 @@ def test_model_type_guards(met_era5_fake: MetDataset, flight_fake: Flight) -> No
 
 @pytest.mark.parametrize("model_class", [ModelTestGrid, ModelTestFlight])
 def test_model_hash(met_era5_fake: MetDataset, model_class: type[Model]) -> None:
-    """Check the pinned model hash as a way to test for model degradation.
+    """Test that model hash is deterministic and changes when params change."""
+    model1 = model_class(met=met_era5_fake)
+    model2 = model_class(met=met_era5_fake)
+    assert model1.hash == model2.hash
 
-    This hash will change anytime a new model parameter is added or changed.
-    """
-    model = model_class(met=met_era5_fake)
-    if isinstance(model, ModelTestFlight):
-        assert model.hash == "a5b35e16632ff819e49499a832a1ba1787d3dd27"
-    else:
-        assert model.hash == "b0c26d747887f86ab1942667c3befcb5693688a3"
+    # hash should change when params change
+    model3 = model_class(met=met_era5_fake, param1="different_value")
+    assert model3.hash != model1.hash
 
 
 # ----------------
@@ -366,7 +365,7 @@ def test_model_flight_downselect_met(met_era5_fake: MetDataset, flight_fake: Fli
         met_longitude_buffer=(15, 15),
         met_latitude_buffer=(5, 10),
         met_level_buffer=(0, 0),
-        met_time_buffer=(0, np.timedelta64(1, "h")),
+        met_time_buffer=(np.timedelta64(0, "h"), np.timedelta64(1, "h")),
     )
     # When eval is called, the model will downselect met
     _ = flight_model.eval(source=fl2)

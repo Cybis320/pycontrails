@@ -8,7 +8,7 @@ import logging
 import sys
 import warnings
 from collections.abc import Generator, Iterable, Iterator, Sequence
-from typing import Any, Self, overload
+from typing import TYPE_CHECKING, Any, Self, overload
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -20,11 +20,14 @@ import numpy.typing as npt
 import pandas as pd
 import xarray as xr
 
-from pycontrails.core import coordinates, interpolation
+from pycontrails.core import coordinates
 from pycontrails.core import met as met_module
 from pycontrails.physics import units
 from pycontrails.utils import dependencies
 from pycontrails.utils import json as json_utils
+
+if TYPE_CHECKING:
+    from pycontrails.core import interpolation
 
 logger = logging.getLogger(__name__)
 
@@ -1062,7 +1065,7 @@ class VectorDataset:  # noqa: PLW1641
         if out is not marker:
             return out
 
-        arr: np.ndarray = self.data.get(key, marker)  # type: ignore[arg-type]
+        arr: np.ndarray = self.data.get(key, marker)
         if arr is not marker:
             try:
                 vals = np.unique(arr)
@@ -1765,14 +1768,12 @@ class GeoVectorDataset(VectorDataset):
 
         >>> # Intersect
         >>> fl.intersect_met(met['air_temperature'], method='nearest')
-        array([231.62969892, 230.72604651, 232.24318771, 231.88338483,
-               231.06429438, 231.59073409, 231.65125393, 231.93064004,
-               232.03344087, 231.65954432])
+        array([231.63002, 230.72572, 232.2433 , 231.8833 , 231.06396, 231.59033,
+               231.65088, 231.93083, 232.03337, 231.65935], dtype=float32)
 
         >>> fl.intersect_met(met['air_temperature'], method='linear')
-        array([225.77794552, 225.13908414, 226.231218  , 226.31831528,
-               225.56102321, 225.81192149, 226.03192642, 226.22056121,
-               226.03770174, 225.63226188])
+        array([225.77817, 225.13887, 226.23119, 226.3182 , 225.56091, 225.8117 ,
+               226.0319 , 226.2205 , 226.03786, 225.63214], dtype=float32)
 
         >>> # Interpolate and attach to `Flight` instance
         >>> for key in met:
@@ -1781,11 +1782,11 @@ class GeoVectorDataset(VectorDataset):
         >>> # Show the final three columns of the dataframe
         >>> fl.dataframe.iloc[:, -3:].head()
                          time  air_temperature  specific_humidity
-        0 2022-03-01 00:00:00       225.777946           0.000132
-        1 2022-03-01 00:13:20       225.139084           0.000132
-        2 2022-03-01 00:26:40       226.231218           0.000107
-        3 2022-03-01 00:40:00       226.318315           0.000171
-        4 2022-03-01 00:53:20       225.561022           0.000109
+        0 2022-03-01 00:00:00       225.778168           0.000132
+        1 2022-03-01 00:13:20       225.138870           0.000132
+        2 2022-03-01 00:26:40       226.231186           0.000107
+        3 2022-03-01 00:40:00       226.318207           0.000171
+        4 2022-03-01 00:53:20       225.560913           0.000109
 
         """
         # Override use_indices in certain situations
@@ -1821,6 +1822,74 @@ class GeoVectorDataset(VectorDataset):
         )
         if not already_has_indices:
             self._put_indices(indices)
+        return out
+
+    def intersect_met_cross_section(
+        self,
+        mda: met_module.MetDataArray | met_module.MetDataset,
+        *,
+        dim: str = "level",
+        **interp_kwargs: Any,
+    ) -> xr.DataArray | xr.Dataset:
+        """Intersect waypoints with MetDataArray or MetDataset, retaining one dimension.
+
+        This calculates a 2D "curtain" or cross-section of the met data along the trajectory,
+        retaining the full extent of the specific dimension ``dim`` of the met data. This is
+        useful for plotting 2D charts, e.g. vertical flight profiles. While ``intersect_met``
+        returns a 1D result, this method returns a 2D result.
+
+        Parameters
+        ----------
+        mda : met_module.MetDataArray | met_module.MetDataset
+            MetDataArray or MetDataset containing meteorological variable(s).
+        dim : str, optional
+            Dimension to retain. Typically "level", "time", "latitude", or "longitude".
+            Defaults to "level".
+        **interp_kwargs : Any
+            Additional keyword arguments to pass to :meth:`xr.DataArray.interp` or
+            :meth:`xr.Dataset.interp`.
+
+        Returns
+        -------
+        xr.DataArray | xr.Dataset
+            Interpolated cross-section. The resulting DataArray or Dataset will have
+            dimensions ``(dim, waypoint)``. The ``waypoint`` dimension will correspond
+            to the sequence of waypoints in the GeoVectorDataset, and the ``dim`` dimension
+            will correspond to the retained dimension in the Met data.
+        """
+
+        dims = {
+            "longitude": self["longitude"],
+            "latitude": self["latitude"],
+            "level": self.level,
+            "time": self["time"],
+        }
+
+        if dim not in dims:
+            raise ValueError(f"Dimension {dim} not supported, must one of {list(dims)}")
+
+        interp_coords = {d: xr.DataArray(v, dims="waypoint") for d, v in dims.items() if d != dim}
+        interp_kwargs.setdefault("method", "linear")
+
+        out = mda.data.interp(**interp_coords, **interp_kwargs)  # type: ignore
+
+        # Enhance vertical pressure coordinates with physical altitude equivalents.
+        # This allows plotting on top of Flight.plot_profile() which requires altitude_ft.
+        if "level" in out.coords:
+            level_coords = {}
+            if "altitude" not in out.coords:
+                level_coords["altitude"] = (
+                    out.coords["level"].dims,
+                    units.pl_to_m(out.coords["level"].values),
+                )
+            if "altitude_ft" not in out.coords:
+                level_coords["altitude_ft"] = (
+                    out.coords["level"].dims,
+                    units.m_to_ft(units.pl_to_m(out.coords["level"].values)),
+                )
+            if level_coords:
+                out = out.assign_coords(level_coords)
+
         return out
 
     def _put_indices(self, indices: interpolation.RGIArtifacts) -> None:
@@ -1868,6 +1937,8 @@ class GeoVectorDataset(VectorDataset):
             :meth:`scipy.interpolate.RegularGridInterpolator._find_indices`,
             or None if cached output is not present on instance.
         """
+        from pycontrails.core import interpolation
+
         try:
             indices_x = self["_indices_x"]
             indices_y = self["_indices_y"]
@@ -2191,7 +2262,7 @@ def _parse_pandas_time(time: pd.Series) -> pd.Series:
     """
     try:
         # If the time series is a string, try to convert it to a datetime
-        if time.dtype == "O":
+        if isinstance(time.dtype, np.dtypes.ObjectDType | pd.StringDtype):
             return pd.to_datetime(time)
 
         # If the time is an int, try to parse it as unix time

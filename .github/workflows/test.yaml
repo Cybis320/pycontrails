@@ -22,6 +22,9 @@ on:
 env:
   PYCONTRAILS_CACHE_DIR: '${{ github.workspace }}/.cache/pycontrails'
   BADA_CACHE_DIR: '${{ github.workspace }}/.cache/bada/'
+  CH_AVIATION_ROOT_PATH: '${{ github.workspace }}/.cache/ch-aviation/'
+  # Skip LEO satellite data-retrieval tests (slow downloads) in CI
+  PYCONTRAILS_SKIP_LEO_TESTS: '1'
 
 # disable all permissions at the top level
 # https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs
@@ -38,11 +41,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        pyversion: ['3.11', '3.12', '3.13']
+        pyversion: ['3.11', '3.12', '3.13', '3.14']
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -53,7 +56,7 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: Cache mypy and pytest
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           # Note the caches are specific to branches, so we don't need to specify here
           # https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache
@@ -71,15 +74,24 @@ jobs:
         uses: google-github-actions/setup-gcloud@v3
 
       - name: Download BADA files
-        timeout-minutes: 5  # `gcloud storage cp` occasionally hangs on windows
         run: |
           mkdir -p ${{ env.BADA_CACHE_DIR }}
-          gcloud storage cp -r gs://contrails-301217-bada/bada/bada3 ${{ env.BADA_CACHE_DIR }}
-          gcloud storage cp -r gs://contrails-301217-bada/bada/bada4 ${{ env.BADA_CACHE_DIR }}
+          gcloud storage cp gs://contrails-301217-bada/bada-tar/bada3.tar.gz ${{ env.BADA_CACHE_DIR }}
+          gcloud storage cp gs://contrails-301217-bada/bada-tar/bada4.tar.gz ${{ env.BADA_CACHE_DIR }}
+          tar xzf ${{ env.BADA_CACHE_DIR }}/bada3.tar.gz -C ${{ env.BADA_CACHE_DIR }}
+          tar xzf ${{ env.BADA_CACHE_DIR }}/bada4.tar.gz -C ${{ env.BADA_CACHE_DIR }}
+          rm ${{ env.BADA_CACHE_DIR }}/*.tar.gz
           ls -l ${{ env.BADA_CACHE_DIR }}
 
+      - name: Download ch-aviation database files
+        run: |
+          mkdir -p ${{ env.CH_AVIATION_ROOT_PATH }}
+          gcloud storage cp gs://contrails-301217-ch-aviation/20260318_fleet_database_processed.csv ${{ env.CH_AVIATION_ROOT_PATH }}
+          gcloud storage cp gs://contrails-301217-ch-aviation/20260318_airline_engine_look_up.csv ${{ env.CH_AVIATION_ROOT_PATH }}
+          ls -l ${{ env.CH_AVIATION_ROOT_PATH }}
+
       - name: Install make - windows
-        if: ${{ matrix.os == 'windows-latest' }}
+        if: matrix.os == 'windows-latest'
         run: choco install make
 
       - name: Install pycontrails (dev)
@@ -89,7 +101,7 @@ jobs:
       - name: Install pycontrails-bada
         run: |
           pip install keyring keyrings.google-artifactregistry-auth
-          pip install -U -i https://us-central1-python.pkg.dev/contrails-301217/pycontrails/simple pycontrails-bada
+          pip install -U -i https://us-central1-python.pkg.dev/contrails-301217/pycontrails/simple pycontrails-bada>=0.9.0
 
       - name: Show environment
         run: |
@@ -100,10 +112,13 @@ jobs:
           mypy --version
           pip list
 
+      - name: mypy
+        if: matrix.pyversion != '3.11'
+        run: make mypy
+
       - name: QC & Test
         shell: bash
         run: |
           pip check
           make lint
-          make mypy
           make pytest

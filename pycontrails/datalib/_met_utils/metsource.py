@@ -7,7 +7,7 @@ import hashlib
 import logging
 import pathlib
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, TypeAlias
 
 import numpy as np
@@ -16,12 +16,17 @@ import xarray as xr
 
 from pycontrails.core import cache
 from pycontrails.core.met import MetDataset, MetVariable
-from pycontrails.utils.types import DatetimeLike
 
 logger = logging.getLogger(__name__)
 
-# https://github.com/python/mypy/issues/14824
-TimeInput: TypeAlias = str | DatetimeLike | Sequence[str | DatetimeLike]
+TimeInput: TypeAlias = (
+    str
+    | datetime
+    | pd.Timestamp
+    | np.datetime64
+    | Sequence[str | datetime | pd.Timestamp | np.datetime64]
+)
+
 VariableInput = (
     str | int | MetVariable | np.ndarray | Sequence[str | int | MetVariable | Sequence[MetVariable]]
 )
@@ -38,7 +43,11 @@ DEFAULT_CHUNKS: dict[str, int] = {"time": 1}
 OPEN_IN_PARALLEL: bool = False
 
 
-def parse_timesteps(time: TimeInput | None, freq: str | None = "1h") -> list[datetime]:
+def parse_timesteps(
+    time: TimeInput | None,
+    freq: str | timedelta | None = "1h",
+    shift: str | timedelta | None = None,
+) -> list[datetime]:
     """Parse time input into set of time steps.
 
     If input time is length 2, this creates a range of equally spaced time
@@ -51,12 +60,17 @@ def parse_timesteps(time: TimeInput | None, freq: str | None = "1h") -> list[dat
         Either a single datetime-like or tuple of datetime-like with the first value
         the start of the date range and second value the end of the time range.
         Input values can be any type compatible with :meth:`pandas.to_datetime`.
-    freq : str | None, optional
+    freq : str | timedelta | None, optional
         Timestep interval in range.
         See https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#timeseries-offset-aliases
         for a list of frequency aliases.
         If None, returns input `time` as a list.
         Defaults to "1h".
+    shift : str | timedelta | None, optional
+        Time shift relative to even multiples of `freq`.
+        If None (the default), time steps will be even multiples of `freq`.
+        Otherwise, time steps will be congruent to `shift` modulo `freq`.
+        This parameter is ignored if `freq` is None.
 
     Returns
     -------
@@ -68,6 +82,22 @@ def parse_timesteps(time: TimeInput | None, freq: str | None = "1h") -> list[dat
     ------
     ValueError
         Raises when the time has len > 2 or when time elements fail to be parsed with pd.to_datetime
+
+    Examples
+    --------
+    >>> parse_timesteps("2000-01-01")
+    [datetime.datetime(2000, 1, 1, 0, 0)]
+
+    >>> parse_timesteps(("2000-01-01", "2000-01-02"), freq=None)
+    [datetime.datetime(2000, 1, 1, 0, 0), datetime.datetime(2000, 1, 2, 0, 0)]
+
+    >>> parse_timesteps(("2000-01-01 00:00", "2000-01-01 03:00"), freq="3h")
+    [datetime.datetime(2000, 1, 1, 0, 0), datetime.datetime(2000, 1, 1, 3, 0)]
+
+    >>> parse_timesteps(("2000-01-01 01:00", "2000-01-01 06:00"), freq="3h", shift="1h")
+    [datetime.datetime(2000, 1, 1, 1, 0), datetime.datetime(2000, 1, 1, 4, 0), \
+    datetime.datetime(2000, 1, 1, 7, 0)]
+
     """
 
     if time is None:
@@ -92,20 +122,44 @@ def parse_timesteps(time: TimeInput | None, freq: str | None = "1h") -> list[dat
         )
         raise ValueError(msg) from e
 
+    # ensure timezone naive
+    if t0.tzinfo:
+        t0 = t0.tz_convert("UTC").tz_localize(None)
+    if t1.tzinfo:
+        t1 = t1.tz_convert("UTC").tz_localize(None)
+
     if freq is None:
         daterange = pd.DatetimeIndex([t0, t1])
-    else:
-        # get date range that encompasses all whole hours
+
+    elif shift is None:
         daterange = pd.date_range(t0.floor(freq), t1.ceil(freq), freq=freq)
         if len(daterange) == 0:
             msg = f"Time range {t0} to {t1} with freq {freq} has no valid time steps."
+            raise ValueError(msg)
+
+    else:
+        try:
+            dt = pd.to_timedelta(shift)
+        except ValueError as e:
+            msg = (
+                f"Failed to parse time shift {shift}. "
+                "Time shift must be compatible with 'pd.to_timedelta()'"
+            )
+            raise ValueError(msg) from e
+
+        daterange = pd.date_range((t0 - dt).floor(freq) + dt, (t1 - dt).ceil(freq) + dt, freq=freq)
+        if len(daterange) == 0:
+            msg = (
+                f"Time range {t0} to {t1} with freq {freq} and shift {shift} "
+                "has no valid time steps."
+            )
             raise ValueError(msg)
 
     # return list of datetimes
     return daterange.to_pydatetime().tolist()
 
 
-def validate_timestep_freq(freq: str, datasource_freq: str) -> bool:
+def validate_timestep_freq(freq: str | timedelta, datasource_freq: str | timedelta) -> bool:
     """Check that input timestep frequency is compatible with the data source timestep frequency.
 
     A data source timestep frequency of 1 hour allows input timestep frequencies of
@@ -113,9 +167,9 @@ def validate_timestep_freq(freq: str, datasource_freq: str) -> bool:
 
     Parameters
     ----------
-    freq : str
+    freq : str | timedelta
         Input timestep frequency
-    datasource_freq : str
+    datasource_freq : str | timedelta
         Datasource timestep frequency
 
     Returns
@@ -504,13 +558,18 @@ class MetDataSource(abc.ABC):
     # Abstract methods to implement
     # -----------------------------
     @abc.abstractmethod
-    def download_dataset(self, times: list[datetime]) -> None:
+    def download_dataset(self, times: list[datetime]) -> list[xr.Dataset] | None:
         """Download data from data source for input times.
 
         Parameters
         ----------
         times : list[datetime]
             List of datetimes to download a store in cache
+
+        Returns
+        -------
+        list[xr.Dataset] | None
+            Downloaded datasets, or None if datasets are written to cache
         """
 
     @abc.abstractmethod
@@ -743,4 +802,6 @@ class MetDataSource(abc.ABC):
         xr_kwargs.setdefault("engine", NETCDF_ENGINE)
         xr_kwargs.setdefault("chunks", DEFAULT_CHUNKS)
         xr_kwargs.setdefault("parallel", OPEN_IN_PARALLEL)
+        xr_kwargs.setdefault("join", "outer")
+        xr_kwargs.setdefault("compat", "no_conflicts")
         return xr.open_mfdataset(disk_paths, **xr_kwargs)

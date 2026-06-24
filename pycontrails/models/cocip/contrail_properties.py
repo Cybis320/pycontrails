@@ -25,7 +25,7 @@ def initial_iwc(
     fuel_dist: npt.NDArray[np.floating],
     width: npt.NDArray[np.floating],
     depth: npt.NDArray[np.floating],
-    ei_h2o: float,
+    ei_h2o: npt.NDArray[np.floating] | float,
 ) -> npt.NDArray[np.floating]:
     r"""
     Estimate the initial contrail ice water content (iwc) before the wake vortex phase.
@@ -47,7 +47,7 @@ def initial_iwc(
         initial contrail width, [:math:`m`]
     depth : npt.NDArray[np.floating]
         initial contrail depth, [:math:`m`]
-    ei_h2o : float
+    ei_h2o : npt.NDArray[np.floating] | float
         water vapor emissions index of fuel, [:math:`kg_{H_{2}O} \ kg_{fuel}^{-1}`]
 
     Returns
@@ -68,7 +68,7 @@ def q_exhaust(
     fuel_dist: npt.NDArray[np.floating],
     width: npt.NDArray[np.floating],
     depth: npt.NDArray[np.floating],
-    ei_h2o: float,
+    ei_h2o: npt.NDArray[np.floating] | float,
 ) -> npt.NDArray[np.floating]:
     r"""
     Calculate the specific humidity released by water vapor from aircraft emissions.
@@ -85,7 +85,7 @@ def q_exhaust(
         initial contrail width, [:math:`m`]
     depth : npt.NDArray[np.floating]
         initial contrail depth, [:math:`m`]
-    ei_h2o : float
+    ei_h2o : npt.NDArray[np.floating] | float
         water vapor emissions index of fuel, [:math:`kg_{H_{2}O} \ kg_{fuel}^{-1}`]
 
     Returns
@@ -236,7 +236,7 @@ def initial_ice_particle_number(
         phase, [:math:`# m^{-1}`]
     """
     if min_aei is not None:
-        aei = np.clip(aei, a_min=min_aei, a_max=None)  # type: ignore[call-overload]
+        aei = np.clip(aei, min_aei, None)
     return fuel_dist * aei
 
 
@@ -835,8 +835,54 @@ def ice_particle_mass(r_ice_vol: npt.NDArray[np.floating]) -> npt.NDArray[np.flo
     return ((4 / 3) * np.pi * r_ice_vol**3) * constants.rho_ice
 
 
+def phase_relaxation_rate(
+    r_ice_vol: npt.NDArray[np.floating],
+    n_ice_per_vol: npt.NDArray[np.floating],
+    diffusivity_water_vapor: npt.NDArray[np.floating],
+) -> npt.NDArray[np.floating]:
+    """
+    Calculate the contrail phase relaxation rate.
+
+    The phase relaxation rate is the inverse of the time scale over which specific humidity inside
+    a contrail relaxes toward saturation due to sublimation or deposition.
+
+    Parameters
+    ----------
+    r_ice_vol : npt.NDArray[np.floating]
+        Ice particle volume mean radius, [:math:`m`]
+
+    n_ice_per_vol: npt.NDArray[np.floating]
+        Number of ice particles per contrail plume volume, [:math:`m^3`]
+
+    diffusivity_water_vapor: npt.NDArray[np.floating]
+        Molecular diffusivity of water vapor, [:math:`m^2 s^{-1}`]
+
+    Returns
+    -------
+    npt.NDArray[np.floating]
+        Phase relaxation rate, [:math:`s^{-1}`]
+
+    References
+    ----------
+    - :cite:`hallSurvivalIceParticles1976`
+    - :cite:`pruppacherMicrophysicsCloudsPrecipitation2010`
+
+    Notes
+    -----
+    The phase relaxation time scale provided by this function is based on a model
+    for diffusional growth of spherical ice crystals.
+
+    See Also
+    --------
+    :func:`thermo.diffusivity_water_vapor`
+    """
+    return 4.0 * np.pi * r_ice_vol * n_ice_per_vol * diffusivity_water_vapor
+
+
 def horizontal_diffusivity(
-    ds_dz: npt.NDArray[np.floating], depth: npt.NDArray[np.floating]
+    ds_dz: npt.NDArray[np.floating],
+    depth: npt.NDArray[np.floating],
+    max_horizontal_diffusivity: float | None,
 ) -> npt.NDArray[np.floating]:
     """
     Calculate contrail horizontal diffusivity.
@@ -848,6 +894,9 @@ def horizontal_diffusivity(
         to altitude (``dz``), [:math:`m s^{-1} / Pa`]
     depth : npt.NDArray[np.floating]
         Contrail depth at each waypoint, [:math:`m`]
+    max_horizontal_diffusivity: float | None
+        Constrain max horizontal diffusivity to prevent unrealistic values, [:math:`m^{2} s^{-1}`]
+        If None is passed, the maximum vertical diffusivity will not be constrained.
 
     Returns
     -------
@@ -862,8 +911,16 @@ def horizontal_diffusivity(
     -----
     Accounts for the turbulence-induced diffusive contrail spreading in
     the horizontal direction.
+
+    The maximum horizontal diffusivity can be limited to 100.0 m^{2} s^{-1}, see Section 2.2 of
+    Schumann & Seifert (2025), https://doi.org/10.5194/acp-25-18571-2025
     """
-    return 0.1 * ds_dz * depth**2
+    d_h = 0.1 * ds_dz * depth**2
+
+    if max_horizontal_diffusivity is not None:
+        d_h = np.minimum(d_h, max_horizontal_diffusivity)
+
+    return d_h
 
 
 def vertical_diffusivity(
@@ -872,8 +929,10 @@ def vertical_diffusivity(
     dT_dz: npt.NDArray[np.floating],
     depth_eff: npt.NDArray[np.floating],
     terminal_fall_speed: npt.NDArray[np.floating] | float,
+    turbulent_vertical_velocity_scale: npt.NDArray[np.floating] | float,
     sedimentation_impact_factor: npt.NDArray[np.floating] | float,
     eff_heat_rate: npt.NDArray[np.floating] | None,
+    max_vertical_diffusivity: float | None,
 ) -> npt.NDArray[np.floating]:
     """
     Calculate contrail vertical diffusivity.
@@ -890,12 +949,17 @@ def vertical_diffusivity(
         Effective depth of the contrail plume, [:math:`m`]
     terminal_fall_speed : npt.NDArray[np.floating] | float
         Terminal fall speed of contrail ice particles, [:math:`m s^{-1}`]
+    turbulent_vertical_velocity_scale : npt.NDArray[np.floating] | float
+        Convective velocity scale, [:math:`m s^{-1}`]
     sedimentation_impact_factor : npt.NDArray[np.floating] | float
         Enhancement parameter denoted by `f_T` in eq. (35) Schumann (2012).
     eff_heat_rate: npt.NDArray[np.floating] | None
         Effective heating rate, i.e., rate of which the contrail plume
         is heated, [:math:`K s^{-1}`]. If None is passed, the radiative
         heating effects on contrail cirrus properties are not included.
+    max_vertical_diffusivity: float | None
+        Constrain max vertical diffusivity to prevent unrealistic values, [:math:`m^{2} s^{-1}`]
+        If None is passed, the maximum vertical diffusivity will not be constrained.
 
     Returns
     -------
@@ -913,25 +977,43 @@ def vertical_diffusivity(
     See eq. (35) of :cite:`schumannContrailCirrusPrediction2012`.
 
     The first term in Eq. (35) of :cite:`schumannContrailCirrusPrediction2012` is
-    (c_V * w'_N^2 / N_BV, where c_V = 0.2 and w'_N^2 = 0.1) is different
-    than outlined below. Here, a constant of 0.01 is used when radiative
-    heating effects are not activated. This update comes from
-    :cite:`schumannAviationinducedCirrusRadiation2013`
-    , which found that the original formulation estimated thinner
-    contrails relative to satellite observations. The vertical diffusivity
-    was enlarged so that the simulated contrails are more consistent with observations.
+    (c_V * w'_N^2 / N_BV, where c_V = 0.2 and w'_N = 0.1 m s-1) is different
+    than outlined below.
+
+    Previously, the c_V = 0.2 term was included in Eq. (35) of
+    :cite:`schumannContrailCirrusPrediction2012`. However, this was removed in
+    :cite:`schumannAviationinducedCirrusRadiation2013` as described in Paragraph 27, meaning that
+    the vertical diffusivity is enhanced by a factor of 5.
+
+    Here, a turbulent vertical velocity scale (provided as input) is used directly when radiative
+    heating effects are not activated. We recommend setting the turbulent vertical velocity scale
+    to 0.1 m s^{-1} based on Eq. (35) of :cite:`schumannContrailCirrusPrediction2012`,
+    which found that the original formulation estimated thinner
+    contrails relative to satellite observations. The recommended value produces
+    simulated contrails are more consistent with observations.
+
+    The maximum vertical diffusivity can be limited to 10.0 m^{2} s^{-1}, see Section 2.2 of
+    Schumann & Seifert (2025), https://doi.org/10.5194/acp-25-18571-2025
     """
     n_bv = thermo.brunt_vaisala_frequency(air_pressure, air_temperature, dT_dz)
     n_bv.clip(min=0.001, out=n_bv)
 
-    cvs: npt.NDArray[np.floating] | float
+    # Vertical diffusivity is enhanced further as radiative heating causes convective instability
+    w_prime: npt.NDArray[np.floating] | float
     if eff_heat_rate is not None:
-        cvs = radiative_heating.convective_velocity_scale(depth_eff, eff_heat_rate, air_temperature)
-        cvs.clip(min=0.01, out=cvs)
+        w_prime = radiative_heating.convective_velocity_scale(
+            depth_eff, eff_heat_rate, air_temperature
+        )
+        w_prime.clip(min=turbulent_vertical_velocity_scale, out=w_prime)
     else:
-        cvs = 0.01
+        w_prime = turbulent_vertical_velocity_scale
 
-    return cvs / n_bv + sedimentation_impact_factor * terminal_fall_speed * depth_eff
+    d_v = w_prime**2 / n_bv + sedimentation_impact_factor * terminal_fall_speed * depth_eff
+
+    if max_vertical_diffusivity is not None:
+        d_v = np.minimum(d_v, max_vertical_diffusivity)
+
+    return d_v
 
 
 ####################
@@ -1370,6 +1452,108 @@ def new_ice_water_content(
     q_mean = 0.5 * (q_t1 + q_t2)
     mass_h2o_t1 = mass_plume_t1 * (iwc_t1 + q_sat_t1)
     mass_h2o_t2 = mass_h2o_t1 + (mass_plume_t2 - mass_plume_t1) * q_mean
+    iwc_t2 = (mass_h2o_t2 / mass_plume_t2) - q_sat_t2
+    iwc_t2.clip(min=0.0, out=iwc_t2)
+    return iwc_t2
+
+
+def new_ice_water_content_revised(
+    iwc_t1: npt.NDArray[np.floating],
+    q_t1: npt.NDArray[np.floating],
+    q_sed: npt.NDArray[np.floating],
+    q_t2: npt.NDArray[np.floating],
+    q_sat_t1: npt.NDArray[np.floating],
+    q_sat_sed: npt.NDArray[np.floating],
+    q_sat_t2: npt.NDArray[np.floating],
+    mass_plume_t1: npt.NDArray[np.floating],
+    mass_plume_sed: npt.NDArray[np.floating],
+    mass_plume_t2: npt.NDArray[np.floating],
+    depth_eff: npt.NDArray[np.floating],
+    terminal_fall_speed: npt.NDArray[np.floating],
+    phase_relax_rate: npt.NDArray[np.floating],
+    dt: npt.NDArray[np.timedelta64],
+) -> npt.NDArray[np.floating]:
+    """
+    Calculate the new contrail ice water content after the time integration step (``iwc_t2``).
+
+    Parameters
+    ----------
+    iwc_t1 : npt.NDArray[np.floating]
+        contrail ice water content, i.e., contrail ice mass per kg of air,
+        at the start of the time step, [:math:`kg_{H_{2}O}/kg_{air}`]
+    q_t1 : npt.NDArray[np.floating]
+        specific humidity for each waypoint at the start of the
+        time step, [:math:`kg_{H_{2}O}/kg_{air}`]
+    q_sed : npt.NDArray[np.floating]
+        specific humidity for each waypoint
+        after sedimentation, [:math:`kg_{H_{2}O}/kg_{air}`]
+    q_t2 : npt.NDArray[np.floating]
+        specific humidity for each waypoint at the end of the
+        time step, [:math:`kg_{H_{2}O}/kg_{air}`]
+    q_sat_t1 : npt.NDArray[np.floating]
+        saturation humidity for each waypoint at the start of the
+        time step, [:math:`kg_{H_{2}O}/kg_{air}`]
+    q_sat_sed : npt.NDArray[np.floating]
+        saturation humidity for each waypoint
+        after sedimentation, [:math:`kg_{H_{2}O}/kg_{air}`]
+    q_sat_t2 : npt.NDArray[np.floating]
+        saturation humidity for each waypoint at the end of the
+        time step, [:math:`kg_{H_{2}O}/kg_{air}`]
+    mass_plume_t1 : npt.NDArray[np.floating]
+        contrail plume mass per unit length at the start of the
+        time step, [:math:`kg_{air} m^{-1}`]
+    mass_plume_sed : npt.NDArray[np.floating]
+        contrail plume mass per unit length
+        after sedimentation, [:math:`kg_{air} m^{-1}`]
+    mass_plume_t2 : npt.NDArray[np.floating]
+        contrail plume mass per unit length at the end of the
+        time step, [:math:`kg_{air} m^{-1}`]
+    depth_eff : npt.NDArray[np.floating]
+        effective depth of contrail plume, [:math:`m`]
+    terminal_fall_speed : npt.NDArray[np.floating]
+        terminal fall speed of contrail plume, [:math:m `s^{-1}`]
+    phase_relax_rate : npt.NDArray[np.floating]
+        phase relaxation rate in the contrail, [:math:`s^{-1}`]
+    dt : npt.NDArray[np.timedelta64]
+        length of time integration step, [:math:`s`]
+
+    Returns
+    -------
+    npt.NDArray[np.floating]
+        Contrail ice water content at the end of the time step, [:math:`kg_{ice} kg_{air}^{-1}`]
+
+    Notes
+    -----
+    (1) Differences between this function and :func:`new_ice_water_content` will be described
+    in a future publication. The documentation for this function will be updated when the
+    publication is available.
+
+    """
+    # change from falling through sub/supersaturated air
+    dt_s = units.dt_to_seconds(dt, iwc_t1.dtype)
+    qa = 0.5 * (q_t1 + q_sed)
+    qs = 0.5 * (q_sat_t1 + q_sat_sed)
+    m = 0.5 * (mass_plume_t1 + mass_plume_sed)
+    delta_mass_h2o_sed = (
+        m
+        * (qs - qa)
+        * np.expm1(-depth_eff * phase_relax_rate / terminal_fall_speed)
+        * terminal_fall_speed
+        * dt_s
+        / depth_eff
+    )
+
+    # change from mixing
+    qa = 0.5 * (q_sed + q_t2)
+    delta_mass_h2o_mix = (mass_plume_t2 - mass_plume_sed) * qa
+
+    # updated ice water content
+    mass_h2o_t2 = (
+        mass_plume_sed * q_sat_sed
+        + mass_plume_t1 * iwc_t1
+        + delta_mass_h2o_mix
+        + delta_mass_h2o_sed
+    )
     iwc_t2 = (mass_h2o_t2 / mass_plume_t2) - q_sat_t2
     iwc_t2.clip(min=0.0, out=iwc_t2)
     return iwc_t2

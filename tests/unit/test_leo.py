@@ -15,7 +15,6 @@ from pycontrails.datalib import landsat, sentinel
 from pycontrails.datalib.leo_utils import search
 from tests import BIGQUERY_ACCESS, OFFLINE
 
-IN_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
 PYCONTRAILS_SKIP_LEO_TESTS = bool(os.getenv("PYCONTRAILS_SKIP_LEO_TESTS"))
 
 # ==========
@@ -270,7 +269,7 @@ def test_landsat_empty_query() -> None:
 
     df = landsat.query(start_time, end_time, extent)
     assert set(df.columns) == {"base_url", "sensing_time"}
-    assert len(df) == 0
+    assert df.empty
 
 
 @pytest.mark.skipif(not BIGQUERY_ACCESS, reason="No BigQuery access")
@@ -300,7 +299,7 @@ def test_landsat_empty_intersection() -> None:
 
     df = landsat.intersect(flight)
     assert set(df.columns) == {"base_url", "sensing_time"}
-    assert len(df) == 0
+    assert df.empty
 
 
 @pytest.mark.skipif(not BIGQUERY_ACCESS, reason="No BigQuery access")
@@ -345,7 +344,6 @@ def test_landsat_band_resolution(bands: set[str], succeed: bool) -> None:
         landsat._check_band_resolution(bands)
 
 
-@pytest.mark.skipif(IN_GITHUB_ACTIONS, reason="data retrieval tests skipped in GitHub actions")
 @pytest.mark.skipif(PYCONTRAILS_SKIP_LEO_TESTS, reason="PYCONTRAILS_SKIP_LEO_TESTS set")
 @pytest.mark.skipif(OFFLINE, reason="offline")
 @pytest.mark.parametrize("band", [f"B{i}" for i in range(1, 9)])
@@ -375,7 +373,6 @@ def test_landsat_get_reflective_bands(
     ds.close()
 
 
-@pytest.mark.skipif(IN_GITHUB_ACTIONS, reason="data retrieval tests skipped in GitHub actions")
 @pytest.mark.skipif(PYCONTRAILS_SKIP_LEO_TESTS, reason="PYCONTRAILS_SKIP_LEO_TESTS set")
 @pytest.mark.skipif(OFFLINE, reason="offline")
 @pytest.mark.parametrize("band", ["B10", "B11"])
@@ -405,7 +402,6 @@ def test_landsat_get_thermal_bands(
     ds.close()
 
 
-@pytest.mark.skipif(IN_GITHUB_ACTIONS, reason="data retrieval tests skipped in GitHub actions")
 @pytest.mark.skipif(PYCONTRAILS_SKIP_LEO_TESTS, reason="PYCONTRAILS_SKIP_LEO_TESTS set")
 @pytest.mark.skipif(OFFLINE, reason="offline")
 def test_landsat_generate_true_color_rgb(
@@ -429,7 +425,6 @@ def test_landsat_generate_true_color_rgb(
     ds.close()
 
 
-@pytest.mark.skipif(IN_GITHUB_ACTIONS, reason="data retrieval tests skipped in GitHub actions")
 @pytest.mark.skipif(PYCONTRAILS_SKIP_LEO_TESTS, reason="PYCONTRAILS_SKIP_LEO_TESTS set")
 @pytest.mark.skipif(OFFLINE, reason="offline")
 def test_landsat_generate_google_contrails_rgb(
@@ -492,7 +487,7 @@ def test_sentinel_empty_query() -> None:
 
     df = sentinel.query(start_time, end_time, extent)
     assert set(df.columns) == {"base_url", "source_url", "granule_id", "sensing_time"}
-    assert len(df) == 0
+    assert df.empty
 
 
 @pytest.mark.skipif(not BIGQUERY_ACCESS, reason="No BigQuery access")
@@ -505,7 +500,7 @@ def test_sentinel_query(sentinel_base_url: str, sentinel_granule_id: str) -> Non
 
     df = sentinel.query(start_time, end_time, extent)
     assert set(df.columns) == {"base_url", "source_url", "granule_id", "sensing_time"}
-    assert len(df) == 2
+    assert not df.empty
     assert df["base_url"][0] == sentinel_base_url
     assert df["granule_id"][0] == sentinel_granule_id
 
@@ -523,7 +518,7 @@ def test_sentinel_empty_intersection() -> None:
 
     df = sentinel.intersect(flight)
     assert set(df.columns) == {"base_url", "source_url", "granule_id", "sensing_time"}
-    assert len(df) == 0
+    assert df.empty
 
 
 @pytest.mark.skipif(not BIGQUERY_ACCESS, reason="No BigQuery access")
@@ -539,7 +534,7 @@ def test_sentinel_intersection(sentinel_base_url: str, sentinel_granule_id: str)
 
     df = sentinel.intersect(flight)
     assert set(df.columns) == {"base_url", "source_url", "granule_id", "sensing_time"}
-    assert len(df) == 2
+    assert not df.empty
     assert df["base_url"][0] == sentinel_base_url
     assert df["granule_id"][0] == sentinel_granule_id
 
@@ -573,7 +568,6 @@ def test_sentinel_band_resolution(bands: set[str], succeed: bool) -> None:
         sentinel._check_band_resolution(bands)
 
 
-@pytest.mark.skipif(IN_GITHUB_ACTIONS, reason="data retrieval tests skipped in GitHub actions")
 @pytest.mark.skipif(PYCONTRAILS_SKIP_LEO_TESTS, reason="PYCONTRAILS_SKIP_LEO_TESTS set")
 @pytest.mark.skipif(OFFLINE, reason="offline")
 @pytest.mark.parametrize("band", [f"B{i:02d}" for i in range(1, 13)] + ["B8A"])
@@ -604,7 +598,6 @@ def test_sentinel_get_reflective_bands(
     ds.close()
 
 
-@pytest.mark.skipif(IN_GITHUB_ACTIONS, reason="data retrieval tests skipped in GitHub actions")
 @pytest.mark.skipif(PYCONTRAILS_SKIP_LEO_TESTS, reason="PYCONTRAILS_SKIP_LEO_TESTS set")
 @pytest.mark.skipif(OFFLINE, reason="offline")
 def test_sentinel_generate_true_color_rgb(

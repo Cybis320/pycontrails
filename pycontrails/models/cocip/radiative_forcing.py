@@ -22,7 +22,7 @@ from pycontrails.physics import geo
 
 
 @dataclasses.dataclass(frozen=True)
-class RFConstants:
+class RFConstantsS2012:
     """
     Constants that are used to calculate the local contrail radiative forcing.
 
@@ -148,7 +148,7 @@ class RFConstants:
 
 
 # create a new constants class to use within module
-RF_CONST = RFConstants()
+RF_CONST_S2012 = RFConstantsS2012()
 
 
 # ----------
@@ -287,7 +287,7 @@ def effective_radius_by_habit(
         effective_radius_myhre,
         0.0,
     ]
-    return np.piecewise(r_vol_um, cond_list, func_list)
+    return np.piecewise(r_vol_um, cond_list, func_list)  # type: ignore[call-overload]
 
 
 def effective_radius_sphere(r_vol_um: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
@@ -444,9 +444,9 @@ def effective_radius_myhre(r_vol_um: npt.NDArray[np.floating]) -> npt.NDArray[np
     return np.minimum(r_vol_um, 45.0)
 
 
-# -----------------
-# Radiative Forcing
-# -----------------
+# ----------------------------------------------------------
+# Parametric radiative forcing model: Schumann et al. (2012)
+# ----------------------------------------------------------
 
 
 def longwave_radiative_forcing(
@@ -504,11 +504,11 @@ def longwave_radiative_forcing(
     idx0, idx1 = np.nonzero(habit_weight_mask)
 
     # Convert parametric coefficients for vectorized operations
-    delta_t = RF_CONST.delta_t[idx1]
-    delta_lc = RF_CONST.delta_lc[idx1]
-    delta_lr = RF_CONST.delta_lr[idx1]
-    k_t = RF_CONST.k_t[idx1]
-    T_0 = RF_CONST.T_0[idx1]
+    delta_t = RF_CONST_S2012.delta_t[idx1]
+    delta_lc = RF_CONST_S2012.delta_lc[idx1]
+    delta_lr = RF_CONST_S2012.delta_lr[idx1]
+    k_t = RF_CONST_S2012.k_t[idx1]
+    T_0 = RF_CONST_S2012.T_0[idx1]
 
     olr_h = olr[idx0]
     tau_cirrus_h = tau_cirrus[idx0]
@@ -615,16 +615,16 @@ def shortwave_radiative_forcing(
     idx0, idx1 = np.nonzero(habit_weight_mask)
 
     # Convert parametric coefficients for vectorized operations
-    t_a = RF_CONST.t_a[idx1]
-    A_mu = RF_CONST.A_mu[idx1]
-    B_mu = RF_CONST.B_mu[idx1]
-    C_mu = RF_CONST.C_mu[idx1]
-    delta_sr = RF_CONST.delta_sr[idx1]
-    F_r = RF_CONST.F_r[idx1]
-    gamma_lower = RF_CONST.gamma_lower[idx1]
-    gamma_upper = RF_CONST.gamma_upper[idx1]
-    delta_sc = RF_CONST.delta_sc[idx1]
-    delta_sc_aps = RF_CONST.delta_sc_aps[idx1]
+    t_a = RF_CONST_S2012.t_a[idx1]
+    A_mu = RF_CONST_S2012.A_mu[idx1]
+    B_mu = RF_CONST_S2012.B_mu[idx1]
+    C_mu = RF_CONST_S2012.C_mu[idx1]
+    delta_sr = RF_CONST_S2012.delta_sr[idx1]
+    F_r = RF_CONST_S2012.F_r[idx1]
+    gamma_lower = RF_CONST_S2012.gamma_lower[idx1]
+    gamma_upper = RF_CONST_S2012.gamma_upper[idx1]
+    delta_sc = RF_CONST_S2012.delta_sc[idx1]
+    delta_sc_aps = RF_CONST_S2012.delta_sc_aps[idx1]
 
     sdr_h = sdr[idx0]
     rsr_h = rsr[idx0]
@@ -880,6 +880,366 @@ def effective_tau_cirrus(
     return np.exp(tau_cirrus * delta_sc_aps - tau_cirrus_eff * delta_sc)
 
 
+# ---------------------------------------------------
+# Parametric radiative forcing model: Schumann (2025)
+# ---------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class RFConstantsS2025:
+    """
+    Constants that are used to calculate the local contrail radiative forcing (Schumann, 2025).
+
+    Each coefficient has 8 elements, one corresponding to each contrail ice particle habit (shape)::
+
+        [
+            Sphere,
+            Solid column,
+            Hollow column,
+            Rough aggregate,
+            Rosette-6,
+            Plate,
+            Droxtal,
+            Myhre,
+        ]
+
+    For each waypoint, the distinct mix of ice particle habits are approximated using the mean
+    contrail ice particle radius (``r_vol_um``) relative to ``radius_threshold_um``.
+
+    For example:
+
+    - if ``r_vol_um`` for a waypoint < 5 um, the mix of ice particle habits will be 100% droxtals.
+    - if ``r_vol_um`` for a waypoint between 5 and 9.5 um, the mix of ice particle habits will
+      be 30% solid columns, 70% droxtals.
+
+    See Table 2 from :cite:`schumannEffectiveRadiusIce2011`.
+
+    References
+    ----------
+    - `mo_rf.f90` in Schumann (2025), https://doi.org/10.5281/zenodo.17581103
+    - Figure 8 of Schumann et al. (2025), https://doi.org/10.5194/acp-25-18571-2025
+
+    Notes
+    -----
+    - Coefficients obtained directly from the algorithm of Schumann (2025).
+    """
+
+    # -----
+    # Variables/coefficients used to calculate the local contrail longwave radiative forcing.
+    # -----
+    ak = np.array([3.23595, 3.25723, 3.23853, 3.20214, 3.22151, 3.20444, 4.00515, 3.24338])
+
+    sigma = np.array(
+        [
+            3.35993e-06,
+            3.00607e-06,
+            3.33420e-06,
+            4.09619e-06,
+            3.67116e-06,
+            4.02626e-06,
+            4.94882e-08,
+            3.21650e-06,
+        ]
+    )
+
+    delta = np.array(
+        [0.874430, 0.776886, 0.713890, 0.657861, 0.716007, 0.687059, 0.842696, 0.769347]
+    )
+
+    qlw = np.array([0.312496, 0.386529, 0.370883, 0.297256, 0.218414, 1.97702, 0.252445, 0.248097])
+
+    c_dtauci = np.array(
+        [0.200662, 0.174288, 0.148988, 0.0944375, 0.197152, 0.146475, 0.235398, 0.135923]
+    )
+
+    tau_exp_lw = np.array(
+        [0.941626, 0.921358, 0.924119, 0.929786, 0.931181, 0.927095, 0.856405, 0.924699]
+    )
+
+    # -----
+    # Variables/coefficients used to calculate the local contrail shortwave radiative forcing.
+    # -----
+    gamma = np.array([9.06419, 5.45276, 6.61548, 5.49484, 6.66096, 7.96645, 6.15650, 6.69045])
+
+    gammas = np.array([40.5364, 16.8060, 22.3319, 16.9001, 25.5195, 7.61456, 9.75937, 9.33121])
+
+    tt = np.array([0.879304, 0.901417, 0.881617, 0.898850, 0.879667, 0.883407, 0.898837, 1.00788])
+
+    galbs = np.array(
+        [0.432165, 0.874683, 0.647569, 0.897522, 0.712315, 0.720927, 0.815349, 0.932811]
+    )
+
+    acth = np.array(
+        [0.0129326, 0.0249145, 0.0190486, 0.0245007, 0.0201106, 0.0394534, 0.0325837, 0.0590863]
+    )
+
+    bcth = np.array([1.41410, 1.37992, 1.56329, 1.40405, 1.38461, 1.58401, 1.34064, 1.45445])
+
+    ccth = np.array(
+        [0.174603, 0.312233, 0.336866, 0.331776, 0.174517, 0.246677, 0.224502, 0.338728]
+    )
+
+    dcth = np.array(
+        [0.838433, 0.680409, 0.665093, 0.625401, 0.795688, 0.500001, 0.452205, 0.807171]
+    )
+
+    frsw = np.array([0.930169, 0.918669, 1.00763, 0.742713, 0.945019, 3.40950, 1.37480, 1.39646])
+
+    raddsw = np.array([5.99100, 37.5521, 39.3959, 121.831, 20.5531, 16.8181, 156.619, 163.951])
+
+    qsw = np.array([1.90758, 3.15424, 3.15424, 1.63419, 2.70324, 1.66234, 1.88483, 1.88483])
+
+    exalb = np.array(
+        [0.155310, 0.142510, 0.165978, 0.149808, 0.165641, 0.167064, 0.172320, 0.212536]
+    )
+
+    c_dtauci_sw = np.array(
+        [0.224998, 0.195919, 0.242060, 0.206488, 0.238648, 0.261965, 0.245360, 0.300703]
+    )
+
+
+RF_CONST_S2025 = RFConstantsS2025()
+
+
+def longwave_radiative_forcing_s2025(
+    r_vol_um: npt.NDArray[np.floating],
+    olr: npt.NDArray[np.floating],
+    air_temperature: npt.NDArray[np.floating],
+    tau_contrail: npt.NDArray[np.floating],
+    tau_cirrus: npt.NDArray[np.floating],
+    habit_weights_: npt.NDArray[np.floating],
+    r_eff_um: npt.NDArray[np.floating] | None = None,
+) -> npt.NDArray[np.floating]:
+    r"""
+    Calculate the local contrail longwave radiative forcing (:math:`RF_{LW}`).
+
+    All returned values are positive.
+
+    Parameters
+    ----------
+    r_vol_um : npt.NDArray[np.floating]
+        Contrail ice particle volume mean radius, [:math:`\mu m`]
+    olr : npt.NDArray[np.floating]
+        Outgoing longwave radiation at each waypoint, [:math:`W m^{-2}`]
+    air_temperature : npt.NDArray[np.floating]
+        Ambient temperature at each waypoint, [:math:`K`]
+    tau_contrail : npt.NDArray[np.floating]
+        Contrail optical depth at each waypoint
+    tau_cirrus : npt.NDArray[np.floating]
+        Optical depth of numerical weather prediction (NWP) cirrus above the
+        contrail at each waypoint
+    habit_weights_ : npt.NDArray[np.floating]
+        Weights to different ice particle habits for each waypoint,
+        ``n_waypoints x 8`` (habit) columns, [:math:`[0 - 1]`]
+    r_eff_um : npt.NDArray[np.floating] | None, optional
+        Provide effective radius corresponding to elements in ``r_vol_um``, [:math:`\mu m`].
+        Defaults to None, which means the effective radius will be calculated using ``r_vol_um``
+        and habit types in :func:`effective_radius_by_habit`.
+
+    Returns
+    -------
+    npt.NDArray[np.floating]
+        Local contrail longwave radiative forcing (positive), [:math:`W m^{-2}`]
+
+    Raises
+    ------
+    ValueError
+        If `r_eff_um` and `olr` have different shapes.
+
+    References
+    ----------
+    - `mo_rf.f90` in Schumann (2025), https://doi.org/10.5281/zenodo.17581103
+    - Figure 8 of Schumann et al. (2025), https://doi.org/10.5194/acp-25-18571-2025
+
+    Notes
+    -----
+    - Equations obtained directly from the algorithm of Schumann (2025).
+    """
+    # get list of habit weight indexs where the weights > 0
+    # this is a tuple of (np.array[waypoint index], np.array[habit type index])
+    habit_weight_mask = habit_weights_ > 0.0
+    idx0, idx1 = np.nonzero(habit_weight_mask)
+
+    # Convert parametric coefficients for vectorized operations
+    ak = RF_CONST_S2025.ak[idx1]
+    sigma = RF_CONST_S2025.sigma[idx1]
+    delta = RF_CONST_S2025.delta[idx1]
+    qlw = RF_CONST_S2025.qlw[idx1]
+    c_dtauci = RF_CONST_S2025.c_dtauci[idx1]
+    tau_exp_lw = RF_CONST_S2025.tau_exp_lw[idx1]
+
+    olr_h = olr[idx0]
+    tau_cirrus_h = tau_cirrus[idx0]
+    tau_contrail_h = tau_contrail[idx0]
+    air_temperature_h = air_temperature[idx0]
+
+    # effective radius
+    if r_eff_um is None:
+        r_vol_um_h = r_vol_um[idx0]
+        r_eff_um_h = effective_radius_by_habit(r_vol_um_h, idx1)
+    else:
+        if r_eff_um.shape != olr.shape:
+            raise ValueError(
+                "User provided effective radius (`r_eff_um`) must have the same shape as `olr`"
+                f" {olr.shape}"
+            )
+
+        r_eff_um_h = r_eff_um[idx0]
+
+    # Longwave radiation calculations: Calculate the RF LW per habit type
+    rf_lw_per_habit = (
+        (olr_h - sigma * (air_temperature_h**ak))
+        * (1.0 - np.exp(-delta * np.exp(np.log(tau_contrail_h) * tau_exp_lw)))
+        * (1.0 - np.exp(-qlw * r_eff_um_h))
+        * np.exp(-c_dtauci * tau_cirrus_h)
+    )
+    rf_lw_per_habit.clip(min=0.0, out=rf_lw_per_habit)
+
+    # Weight and sum the RF contributions of each habit type according the habit weight
+    # regime at the waypoint
+    # see eqn (12) in :cite:`schumannParametricRadiativeForcing2012`
+    # use fancy indexing to re-assign values to 2d array of waypoint x habit type
+    rf_lw_weighted = np.zeros_like(habit_weights_)
+    rf_lw_weighted[idx0, idx1] = rf_lw_per_habit * habit_weights_[habit_weight_mask]
+    return np.sum(rf_lw_weighted, axis=1)
+
+
+def shortwave_radiative_forcing_s2025(
+    r_vol_um: npt.NDArray[np.floating],
+    sdr: npt.NDArray[np.floating],
+    rsr: npt.NDArray[np.floating],
+    sd0: npt.NDArray[np.floating],
+    tau_contrail: npt.NDArray[np.floating],
+    tau_cirrus: npt.NDArray[np.floating],
+    habit_weights_: npt.NDArray[np.floating],
+    r_eff_um: npt.NDArray[np.floating] | None = None,
+) -> npt.NDArray[np.floating]:
+    r"""
+    Calculate the local contrail shortwave radiative forcing (:math:`RF_{SW}`).
+
+    All returned values are negative.
+
+    Parameters
+    ----------
+    r_vol_um : npt.NDArray[np.floating]
+        Contrail ice particle volume mean radius, [:math:`\mu m`]
+    sdr : npt.NDArray[np.floating]
+        Solar direct radiation, [:math:`W m^{-2}`]
+    rsr : npt.NDArray[np.floating]
+        Reflected solar radiation, [:math:`W m^{-2}`]
+    sd0 : npt.NDArray[np.floating]
+        Solar constant, [:math:`W m^{-2}`]
+    tau_contrail : npt.NDArray[np.floating]
+        Contrail optical depth for each waypoint
+    tau_cirrus : npt.NDArray[np.floating]
+        Optical depth of numerical weather prediction (NWP) cirrus above the
+        contrail for each waypoint.
+    habit_weights_ : npt.NDArray[np.floating]
+        Weights to different ice particle habits for each waypoint,
+        ``n_waypoints x 8`` (habit) columns, [:math:`[0 - 1]`]
+    r_eff_um : npt.NDArray[np.floating] | None, optional
+        Provide effective radius corresponding to elements in ``r_vol_um``, [:math:`\mu m`].
+        Defaults to None, which means the effective radius will be calculated using ``r_vol_um``
+        and habit types in :func:`effective_radius_by_habit`.
+
+    Returns
+    -------
+    npt.NDArray[np.floating]
+        Local contrail shortwave radiative forcing (negative), [:math:`W m^{-2}`]
+
+    Raises
+    ------
+    ValueError
+        If `r_eff_um` and `sdr` have different shapes.
+
+    References
+    ----------
+    - `mo_rf.f90` in Schumann (2025), https://doi.org/10.5281/zenodo.17581103
+    - Figure 8 of Schumann et al. (2025), https://doi.org/10.5194/acp-25-18571-2025
+
+    Notes
+    -----
+    - Equations obtained directly from the algorithm of Schumann (2025).
+    """
+    # create mask for daytime (sdr > 0)
+    day = sdr > 0.0
+
+    # short circuit if no waypoints occur during the day
+    if not day.any():
+        return np.zeros_like(sdr)
+
+    # get list of habit weight indexs where the weights > 0
+    # this is a tuple of (np.array[waypoint index], np.array[habit type index])
+    habit_weight_mask = day.reshape(day.size, 1) & (habit_weights_ > 0.0)
+    idx0, idx1 = np.nonzero(habit_weight_mask)
+
+    # Convert parametric coefficients for vectorized operations
+    gamma = RF_CONST_S2025.gamma[idx1]
+    gammas = RF_CONST_S2025.gammas[idx1]
+    tt = RF_CONST_S2025.tt[idx1]
+    galbs = RF_CONST_S2025.galbs[idx1]
+    acth = RF_CONST_S2025.acth[idx1]
+    bcth = RF_CONST_S2025.bcth[idx1]
+    ccth = RF_CONST_S2025.ccth[idx1]
+    dcth = RF_CONST_S2025.dcth[idx1]
+    frsw = RF_CONST_S2025.frsw[idx1]
+    raddsw = RF_CONST_S2025.raddsw[idx1]
+    qsw = RF_CONST_S2025.qsw[idx1]
+    exalb = RF_CONST_S2025.exalb[idx1]
+    c_dtaucisw = RF_CONST_S2025.c_dtauci_sw[idx1]
+
+    sdr_h = sdr[idx0]
+    rsr_h = rsr[idx0]
+    sd0_h = sd0[idx0]
+    tau_contrail_h = tau_contrail[idx0]
+    tau_cirrus_h = tau_cirrus[idx0]
+
+    albedo_ = albedo(sdr_h, rsr_h)
+    mue = np.minimum(sdr_h / sd0_h, 1.0)
+
+    # effective radius
+    if r_eff_um is None:
+        r_vol_um_h = r_vol_um[idx0]
+        r_eff_um_h = effective_radius_by_habit(r_vol_um_h, idx1)
+    else:
+        if r_eff_um.shape != sdr.shape:
+            raise ValueError(
+                "User provided effective radius (`r_eff_um`) must have the same shape as `sdr`"
+                f" {sdr.shape}"
+            )
+
+        r_eff_um_h = r_eff_um[idx0]
+
+    # Local contrail shortwave radiative forcing calculations
+    abk = acth / (0.5 ** (bcth + ccth))
+    log_mue = np.log(mue)
+    log_one_minus_mue = np.log(1 - mue)
+    cthf = np.exp(log_one_minus_mue * bcth) * np.exp(log_mue * ccth) * abk - acth
+    qcth = 1.0 / (mue + 1.0e-6)
+    taucth = tau_contrail_h * qcth
+
+    # calculate the RF SW per habit type
+    rf_sw_per_habit = -(
+        sdr_h
+        * ((tt - albedo_) ** 2)
+        * (taucth / (gamma + taucth))
+        * (dcth + cthf * (gammas + tau_contrail_h * galbs) / (1.0 + tau_contrail_h * galbs))
+        * (1.0 + frsw * np.exp(-r_eff_um_h / raddsw))
+        * (1.0 - np.exp(-qsw * r_eff_um_h))
+        * np.exp((c_dtaucisw - exalb * qcth) * tau_cirrus_h)
+    )
+    rf_sw_per_habit.clip(max=0.0, out=rf_sw_per_habit)
+
+    # Weight and sum the RF contributions of each habit type according the
+    # habit weight regime at the waypoint
+    # see eqn (12) in :cite:`schumannParametricRadiativeForcing2012`
+    # use fancy indexing to re-assign values to 2d array of waypoint x habit type
+    rf_sw_weighted = np.zeros_like(habit_weights_)
+    rf_sw_weighted[idx0, idx1] = rf_sw_per_habit * habit_weights_[habit_weight_mask]
+
+    return np.sum(rf_sw_weighted, axis=1)
+
+
 # -----------------------------
 # Contrail-contrail overlapping
 # -----------------------------
@@ -894,6 +1254,7 @@ def contrail_contrail_overlap_radiative_effects(
     max_altitude_m: float = 13000.0,
     dz_overlap_m: float = 500.0,
     spatial_grid_res: float = 0.25,
+    rf_model_s2025: bool = False,
 ) -> GeoVectorDataset:
     r"""
     Calculate radiative properties after accounting for contrail overlapping.
@@ -931,6 +1292,9 @@ def contrail_contrail_overlap_radiative_effects(
         See :attr:`CocipParams.dz_overlap_m`
     spatial_grid_res : float
         Spatial grid resolution, [:math:`\deg`]
+    rf_model_s2025 : bool
+        Use alternative parametric RF model (Schumann, 2025)
+        See :attr:`CocipParams.parametric_rf_model_s2025`
 
     Returns
     -------
@@ -1030,7 +1394,10 @@ def contrail_contrail_overlap_radiative_effects(
 
         # Calculate local contrail SW and LW RF with contrail overlapping
         contrails_level = _local_sw_and_lw_rf_with_contrail_overlap(
-            contrails_level, habit_distributions, radius_threshold_um
+            contrails_level,
+            habit_distributions,
+            radius_threshold_um,
+            rf_model_s2025=rf_model_s2025,
         )
 
         # Cumulative change in background RSR and OLR fields
@@ -1154,6 +1521,8 @@ def _local_sw_and_lw_rf_with_contrail_overlap(
     contrails_level: GeoVectorDataset,
     habit_distributions: npt.NDArray[np.floating],
     radius_threshold_um: npt.NDArray[np.floating],
+    *,
+    rf_model_s2025: bool = False,
 ) -> GeoVectorDataset:
     """
     Calculate local contrail SW and LW RF after accounting for contrail overlapping.
@@ -1168,6 +1537,9 @@ def _local_sw_and_lw_rf_with_contrail_overlap(
     radius_threshold_um : npt.NDArray[np.floating]
         Radius thresholds for habit distributions.
         See :attr:`CocipParams.radius_threshold_um`
+    rf_model_s2025 : bool
+        Use alternative parametric RF model (Schumann, 2025)
+        See :attr:`CocipParams.parametric_rf_model_s2025`
 
     Returns
     -------
@@ -1185,24 +1557,46 @@ def _local_sw_and_lw_rf_with_contrail_overlap(
     tau_cirrus = contrails_level["tau_cirrus"] + contrails_level["tau_contrails_above"]
 
     # Calculate local SW and LW RF
-    contrails_level["rf_sw_overlap"] = shortwave_radiative_forcing(
-        r_vol_um,
-        contrails_level["sdr"],
-        contrails_level["rsr_overlap"],
-        sd0,
-        tau_contrail,
-        tau_cirrus,
-        habit_w,
-    )
+    if rf_model_s2025:
+        contrails_level["rf_sw_overlap"] = shortwave_radiative_forcing_s2025(
+            r_vol_um,
+            contrails_level["sdr"],
+            contrails_level["rsr_overlap"],
+            sd0,
+            tau_contrail,
+            tau_cirrus,
+            habit_w,
+        )
 
-    contrails_level["rf_lw_overlap"] = longwave_radiative_forcing(
-        r_vol_um,
-        contrails_level["olr_overlap"],
-        contrails_level["air_temperature"],
-        tau_contrail,
-        tau_cirrus,
-        habit_w,
-    )
+        contrails_level["rf_lw_overlap"] = longwave_radiative_forcing_s2025(
+            r_vol_um,
+            contrails_level["olr_overlap"],
+            contrails_level["air_temperature"],
+            tau_contrail,
+            tau_cirrus,
+            habit_w,
+        )
+
+    else:
+        contrails_level["rf_sw_overlap"] = shortwave_radiative_forcing(
+            r_vol_um,
+            contrails_level["sdr"],
+            contrails_level["rsr_overlap"],
+            sd0,
+            tau_contrail,
+            tau_cirrus,
+            habit_w,
+        )
+
+        contrails_level["rf_lw_overlap"] = longwave_radiative_forcing(
+            r_vol_um,
+            contrails_level["olr_overlap"],
+            contrails_level["air_temperature"],
+            tau_contrail,
+            tau_cirrus,
+            habit_w,
+        )
+
     contrails_level["rf_net_overlap"] = (
         contrails_level["rf_lw_overlap"] + contrails_level["rf_sw_overlap"]
     )

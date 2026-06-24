@@ -26,7 +26,7 @@ from pycontrails.models.ps_model.ps_aircraft_params import PSAircraftEngineParam
 from pycontrails.physics import units
 from pycontrails.utils.types import ArrayOrFloat
 
-# mypy: disable-error-code = type-var
+# mypy: disable-error-code = "type-var, arg-type, return-value"
 
 
 @dataclasses.dataclass
@@ -183,7 +183,11 @@ class _PerfVariables:
     q_fuel: float
 
 
-def _nominal_perf(aircraft_mass: ArrayOrFloat, perf: _PerfVariables) -> AircraftPerformanceGridData:
+def _nominal_perf(
+    aircraft_mass: ArrayOrFloat,
+    perf: _PerfVariables,
+    engine_deterioration_factor: float,
+) -> AircraftPerformanceGridData[ArrayOrFloat]:
     """Compute nominal Poll-Schumann aircraft performance."""
 
     atyp_param = perf.atyp_param
@@ -229,7 +233,11 @@ def _nominal_perf(aircraft_mass: ArrayOrFloat, perf: _PerfVariables) -> Aircraft
     np.clip(c_t, 0.0, c_t_available, out=c_t)
 
     engine_efficiency = ps_model.overall_propulsion_efficiency(
-        mach_number, c_t, c_t_eta_b, atyp_param
+        mach_number,
+        c_t,
+        c_t_eta_b,
+        atyp_param,
+        engine_deterioration_factor=engine_deterioration_factor,
     )
 
     fuel_flow = ps_model.fuel_mass_flow_rate(
@@ -248,13 +256,17 @@ def _nominal_perf(aircraft_mass: ArrayOrFloat, perf: _PerfVariables) -> Aircraft
     )
 
 
-def _newton_func(aircraft_mass: ArrayOrFloat, perf: _PerfVariables) -> ArrayOrFloat:
+def _newton_func(
+    aircraft_mass: ArrayOrFloat,
+    perf: _PerfVariables,
+    engine_deterioration_factor: float,
+) -> ArrayOrFloat:
     """Approximate the derivative of the engine efficiency with respect to mass.
 
     This is used to find the mass at which the engine efficiency is maximized.
     """
-    eta1 = _nominal_perf(aircraft_mass + 0.5, perf).engine_efficiency
-    eta2 = _nominal_perf(aircraft_mass - 0.5, perf).engine_efficiency
+    eta1 = _nominal_perf(aircraft_mass + 0.5, perf, engine_deterioration_factor).engine_efficiency
+    eta2 = _nominal_perf(aircraft_mass - 0.5, perf, engine_deterioration_factor).engine_efficiency
     return eta1 - eta2
 
 
@@ -271,6 +283,7 @@ def _min_mass(
 def _estimate_mass_extremes(
     atyp_param: PSAircraftEngineParams,
     perf: _PerfVariables,
+    engine_deterioration_factor: float,
     n_iter: int = 3,
 ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
     """Calculate the minimum and maximum mass for a given aircraft type."""
@@ -284,16 +297,16 @@ def _estimate_mass_extremes(
     for _ in range(n_iter):
         # Estimate the fuel required to cruise at 35,000 ft for 90 minutes.
         # This is used to compute the reserve fuel.
-        ff = _nominal_perf(min_mass, perf).fuel_flow
+        ff = _nominal_perf(min_mass, perf, engine_deterioration_factor).fuel_flow
         reserve_fuel = ff * 60.0 * 90.0  # 90 minutes
         min_mass = _min_mass(oem, lf, mpm, reserve_fuel)
 
     # Crude: Assume 2x the fuel flow of cruise for climb
     # Compute the maximum weight at cruise by assuming a 20 minute climb
-    ff = _nominal_perf(mtow, perf).fuel_flow
+    ff = _nominal_perf(mtow, perf, engine_deterioration_factor).fuel_flow
     max_mass = mtow - 2.0 * ff * 60.0 * 20.0
 
-    return min_mass, max_mass  # type: ignore[return-value]
+    return min_mass, max_mass
 
 
 def _parse_variables(
@@ -321,7 +334,7 @@ def _parse_variables(
             raise KeyError(msg) from exc
 
         air_temperature, pressure_da = xr.broadcast(air_temperature, pressure_da)
-        return (  # type: ignore[return-value]
+        return (
             air_temperature.dims,
             air_temperature.coords,
             np.asarray(pressure_da),
@@ -411,36 +424,36 @@ def ps_nominal_grid(
     >>> perf.to_dataframe().round({"aircraft_mass": 0, "engine_efficiency": 3, "fuel_flow": 3})
            aircraft_mass  engine_efficiency  fuel_flow
     level
-    200.0        58416.0              0.301      0.576
+    200.0        58416.0              0.301      0.575
     210.0        61618.0              0.301      0.604
     220.0        64830.0              0.301      0.633
     230.0        68026.0              0.301      0.663
-    240.0        71188.0              0.301      0.695
-    250.0        71775.0              0.301      0.703
-    260.0        71766.0              0.300      0.708
-    270.0        71752.0              0.300      0.715
-    280.0        71736.0              0.299      0.722
-    290.0        71717.0              0.298      0.730
+    240.0        71188.0              0.301      0.694
+    250.0        71776.0              0.301      0.703
+    260.0        71767.0              0.301      0.708
+    270.0        71753.0              0.300      0.714
+    280.0        71737.0              0.299      0.721
+    290.0        71719.0              0.298      0.730
 
     >>> # Now compute it for a higher Mach number
     >>> perf = ps_nominal_grid("A320", level=level, mach_number=0.78)
     >>> perf.to_dataframe().round({"aircraft_mass": 0, "engine_efficiency": 3, "fuel_flow": 3})
            aircraft_mass  engine_efficiency  fuel_flow
     level
-    200.0        58473.0              0.307      0.601
+    200.0        58471.0              0.307      0.600
     210.0        60626.0              0.307      0.621
     220.0        63818.0              0.307      0.651
-    230.0        66994.0              0.307      0.682
+    230.0        66994.0              0.307      0.681
     240.0        70130.0              0.307      0.714
-    250.0        71703.0              0.307      0.733
-    260.0        71690.0              0.306      0.739
-    270.0        71673.0              0.306      0.747
-    280.0        71653.0              0.305      0.756
-    290.0        71631.0              0.304      0.766
+    250.0        71704.0              0.307      0.732
+    260.0        71691.0              0.306      0.739
+    270.0        71675.0              0.306      0.747
+    280.0        71655.0              0.305      0.756
+    290.0        71632.0              0.304      0.765
     """
     dims, coords, air_pressure, air_temperature = _parse_variables(level, air_temperature)
 
-    aircraft_engine_params = ps_model.load_aircraft_engine_params(engine_deterioration_factor)
+    aircraft_engine_params = ps_model.load_aircraft_engine_params()
 
     try:
         atyp_param = aircraft_engine_params[aircraft_type]
@@ -461,7 +474,7 @@ def ps_nominal_grid(
         q_fuel=q_fuel,
     )
 
-    min_mass, max_mass = _estimate_mass_extremes(atyp_param, perf)
+    min_mass, max_mass = _estimate_mass_extremes(atyp_param, perf, engine_deterioration_factor)
 
     mass_allowed = ps_operational_limits.max_allowable_aircraft_mass(
         air_pressure,
@@ -481,7 +494,7 @@ def ps_nominal_grid(
     # This is the critical step of the calculation
     aircraft_mass = scipy.optimize.newton(
         func=_newton_func,
-        args=(perf,),
+        args=(perf, engine_deterioration_factor),
         x0=x0,
         tol=80.0,  # use roughly the weight of a passenger as a tolerance
         disp=False,
@@ -493,7 +506,7 @@ def ps_nominal_grid(
 
     aircraft_mass.clip(min=min_mass, max=max_mass, out=aircraft_mass)
 
-    output = _nominal_perf(aircraft_mass, perf)
+    output = _nominal_perf(aircraft_mass, perf, engine_deterioration_factor)
 
     engine_efficiency = output.engine_efficiency
     fuel_flow = output.fuel_flow
@@ -523,6 +536,7 @@ def _newton_mach(
     aircraft_mass: ArrayOrFloat,
     headwind: ArrayOrFloat,
     cost_index: ArrayOrFloat,
+    engine_deterioration_factor: float,
 ) -> ArrayOrFloat:
     """Approximate the derivative of the cost of a segment based on mach number.
 
@@ -531,13 +545,13 @@ def _newton_mach(
     perf.mach_number = mach_number + 1e-4
     tas = units.mach_number_to_tas(perf.mach_number, perf.air_temperature)
     groundspeed = tas - headwind
-    ff1 = _nominal_perf(aircraft_mass, perf).fuel_flow
+    ff1 = _nominal_perf(aircraft_mass, perf, engine_deterioration_factor).fuel_flow
     eccf1 = (cost_index + ff1 * 60) / groundspeed
 
     perf.mach_number = mach_number - 1e-4
     tas = units.mach_number_to_tas(perf.mach_number, perf.air_temperature)
     groundspeed = tas - headwind
-    ff2 = _nominal_perf(aircraft_mass, perf).fuel_flow
+    ff2 = _nominal_perf(aircraft_mass, perf, engine_deterioration_factor).fuel_flow
     eccf2 = (cost_index + ff2 * 60) / groundspeed
     return eccf1 - eccf2
 
@@ -621,7 +635,7 @@ def ps_nominal_optimize_mach(
     """
     dims = ("level",)
     coords = {"level": level}
-    aircraft_engine_params = ps_model.load_aircraft_engine_params(engine_deterioration_factor)
+    aircraft_engine_params = ps_model.load_aircraft_engine_params()
     try:
         atyp_param = aircraft_engine_params[aircraft_type]
     except KeyError as exc:
@@ -670,14 +684,14 @@ def ps_nominal_optimize_mach(
 
     opt_mach = scipy.optimize.newton(
         func=_newton_mach,
-        args=(perf, aircraft_mass, headwind, cost_index),
+        args=(perf, aircraft_mass, headwind, cost_index, engine_deterioration_factor),
         x0=x0,
         tol=1e-4,
         disp=False,
     ).clip(min=min_mach, max=max_mach)
 
     perf.mach_number = opt_mach
-    output = _nominal_perf(aircraft_mass, perf)
+    output = _nominal_perf(aircraft_mass, perf, engine_deterioration_factor)
 
     engine_efficiency = output.engine_efficiency
     fuel_flow = output.fuel_flow

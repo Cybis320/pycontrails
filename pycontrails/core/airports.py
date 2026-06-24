@@ -226,3 +226,44 @@ def distance_to_airports(
     )
     dist_vertical = altitude - airports["elevation_m"].to_numpy()
     return (dist_horizontal**2 + dist_vertical**2) ** 0.5
+
+
+def distance_between_airports(
+    airports: pd.DataFrame,
+    origin_airport_icao: str,
+    destination_airport_icao: str,
+) -> float | None:
+    r"""
+    Calculate the great-circle distance between the origin and destination airport.
+
+    Parameters
+    ----------
+    airports : pd.DataFrame
+        Airport database in the format returned from :func:`global_airport_database`.
+    origin_airport_icao : str
+        ICAO code of origin airport.
+    destination_airport_icao : str
+        ICAO code of destination airport.
+
+    Returns
+    -------
+    float | None
+        Great-circle distance from waypoint to airports, [:math:`km`] or
+        None if either airport is not found in the database.
+
+    See Also
+    --------
+    :func:`geo.haversine`
+    """
+    # Set icao_code to index, so it can be queried
+    airports_idx = airports.set_index("icao_code")
+
+    try:
+        origin_lon = airports_idx.loc[origin_airport_icao, "longitude"]
+        origin_lat = airports_idx.loc[origin_airport_icao, "latitude"]
+        destination_lon = airports_idx.loc[destination_airport_icao, "longitude"]
+        destination_lat = airports_idx.loc[destination_airport_icao, "latitude"]
+    except KeyError:
+        return None
+
+    return geo.haversine(origin_lon, origin_lat, destination_lon, destination_lat) / 1000.0  #  km

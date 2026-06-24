@@ -138,7 +138,11 @@ class Fleet(Flight):
         fl_attrs = {k: v for k, v in self.fl_attrs.items() if k in flight_ids}
         kwargs.setdefault("fl_attrs", fl_attrs)
 
-        final_waypoints = np.array(self.final_waypoints[mask], copy=copy)
+        # final waypoints must be updated when flights are partially filtered
+        masked = self["flight_id"][mask]
+        final_waypoints = np.empty(masked.size, dtype=bool)
+        final_waypoints[:-1] = masked[:-1] != masked[1:]
+        final_waypoints[-1:] = True
         kwargs.setdefault("final_waypoints", final_waypoints)
 
         return super().filter(mask, copy=copy, **kwargs)

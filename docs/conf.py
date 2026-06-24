@@ -253,14 +253,14 @@ html_theme_options = {
         "color-brand-content": "#34C3EB",
     },
     # Note these paths must be relative to `_static/`
-    # "light_logo": "img/logo.png",
-    # "dark_logo": "img/logo-dark.png",
+    "light_logo": "img/icon-light.svg",
+    "dark_logo": "img/icon-dark.svg",
 }
 
 # The name of an image file (relative to this directory) to place at the top
 # of the sidebar.
 # html_logo = "_static/img/logo.jpg"
-html_favicon = "_static/img/favicon.png"
+html_favicon = "_static/img/favicon.svg"
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,

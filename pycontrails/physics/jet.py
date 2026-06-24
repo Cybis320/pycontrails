@@ -16,13 +16,19 @@ import numpy.typing as npt
 import pandas as pd
 
 from pycontrails.core import flight
+from pycontrails.core.airports import distance_between_airports, global_airport_database
 from pycontrails.physics import constants, units
 from pycontrails.utils.types import ArrayOrFloat, ArrayScalarLike
 
 logger = logging.getLogger(__name__)
 _path_to_static = pathlib.Path(__file__).parent / "static"
-PLF_PATH = _path_to_static / "iata-passenger-load-factors-20250221.csv"
-CLF_PATH = _path_to_static / "iata-cargo-load-factors-20250221.csv"
+PLF_PATH = _path_to_static / "iata-passenger-load-factors-20260304.csv"
+N_SEATS_PATH = _path_to_static / "pax-aircraft-n-seats-ref-values-20260407.csv"
+CLF_PATH = _path_to_static / "dray-2019-annual-mean-cargo-load-factors.csv"
+
+#: `iata-cargo-load-factors-20260304.csv` is replaced by `dray-2019-annual-mean-cargo-load-factors`
+#: The IATA cargo statistics does not distinguish between freight carried in the passenger aircraft
+#: hold and freight carried by dedicated freighter aircraft.
 
 
 # -------------------
@@ -352,8 +358,8 @@ def reserve_fuel_requirements(
 
 
 @functools.cache
-def _historical_regional_load_factor(path: pathlib.Path) -> pd.DataFrame:
-    """Load the historical regional load factor database.
+def _iata_passenger_load_factor_database(path: pathlib.Path) -> pd.DataFrame:
+    """Load the IATA Air Passenger Market Analysis passenger load factor database.
 
     Daily load factors are estimated from linearly interpolating the monthly statistics.
 
@@ -368,14 +374,59 @@ def _historical_regional_load_factor(path: pathlib.Path) -> pd.DataFrame:
     publication of the Air Passenger Market Analysis, where the static file will be continuously
     updated. The report estimates the regional passenger load factor by dividing the revenue
     passenger-km (RPK) by the available seat-km (ASK).
-
-    The monthly **cargo load factor** for each region is compiled from IATA's monthly publication
-    of the Air Cargo Market Analysis, where the static file will be continuously updated.
-    The report estimates the regional cargo load factor by dividing the freight tonne-km (FTK)
-    by the available freight tonne-km (AFTK).
     """
     df = pd.read_csv(path, index_col="Date", parse_dates=True, date_format="%d/%m/%Y")
     return df.resample("D").interpolate()
+
+
+@functools.cache
+def _passenger_aircraft_n_seats_database(path: pathlib.Path) -> dict[str, int]:
+    """Load a derived database containing the number of seats for each passenger aircraft type.
+
+    Reference values for each passenger aircraft type are estimated using the median seat counts
+    from the global ch-aviation fleet database
+
+    Returns
+    -------
+    dict[str, int]
+        Dictionary of the form ``{aircraft_type: n_seats}``.
+    """
+    return pd.read_csv(path, index_col="aircraft_type")["n_seats"].to_dict()
+
+
+@functools.cache
+def _dray_cargo_load_factor_database(path: pathlib.Path) -> pd.DataFrame:
+    """Load the Dray et al. (2024) cargo load factor database.
+
+    2019 annual mean cargo load factors provided by Dray et al. (2024).
+
+    Returns
+    -------
+    pd.DataFrame
+        Historical regional load factor for each day.
+
+    Notes
+    -----
+    The 2019 global and regional annual mean cargo load factors is estimated using data provided by
+    Dray et al. (2024). The cargo load factor for each region and distance range is estimated as
+    the total freight carried divided by the total available freight capacity.
+
+    References
+    ----------
+    - Dray et al., 2024 (https://doi.org/10.1016/j.jairtraman.2024.102692)
+    """
+    df = pd.read_csv(path)
+    df["mean_passenger_hold_freight_lf"] = (
+        df["pax_hold_freight_carried_tonnes"] / df["pax_hold_freight_capacity_tonnes"]
+    )
+    df["mean_dedicated_freight_lf"] = (
+        df["dedicated_freight_carried_tonnes"] / df["dedicated_freight_capacity_tonnes"]
+    )
+
+    # Calculate cargo load factors
+    df["mean_passenger_hold_freight_lf"] = df["mean_passenger_hold_freight_lf"].fillna(0.0)
+    df["mean_dedicated_freight_lf"] = df["mean_dedicated_freight_lf"].fillna(0.0)
+    return df
 
 
 AIRPORT_TO_REGION = {
@@ -404,14 +455,12 @@ AIRPORT_TO_REGION = {
 }
 
 
-def aircraft_load_factor(
+def passenger_load_factor(
     origin_airport_icao: str | None = None,
     first_waypoint_time: pd.Timestamp | None = None,
-    *,
-    freighter: bool = False,
 ) -> float:
     """
-    Estimate passenger/cargo load factor based on historical data.
+    Estimate passenger load factor based on historical data.
 
     Accounts for regional and seasonal differences.
 
@@ -423,13 +472,11 @@ def aircraft_load_factor(
     first_waypoint_time : pd.Timestamp | None
         First waypoint UTC time. If None is provided, then regionally or globally averaged values
         from the trailing twelve months will be used.
-    freighter: bool
-        Historical cargo load factor will be used if true, otherwise use passenger load factor.
 
     Returns
     -------
     float
-        Passenger/cargo load factor [0 - 1], unitless
+        Passenger load factor [0 - 1], unitless
     """
     # If origin airport is provided, use regional load factor.
     # Otherwise, do not allow empty string and `None` to pass
@@ -439,11 +486,8 @@ def aircraft_load_factor(
     else:
         region = "Global"
 
-    # Use passenger or cargo database
-    if freighter:
-        lf_database = _historical_regional_load_factor(CLF_PATH)
-    else:
-        lf_database = _historical_regional_load_factor(PLF_PATH)
+    # Load IATA Air Passenger Market Analysis monthly load factors
+    lf_database = _iata_passenger_load_factor_database(PLF_PATH)
 
     # If `first_waypoint_time` is None, global/regional averages for the trailing twelve months
     # will be assumed.
@@ -474,62 +518,284 @@ def aircraft_load_factor(
     return lf_database.at[date, region].item()
 
 
-def aircraft_weight(aircraft_mass: ArrayOrFloat) -> ArrayOrFloat:
-    """Calculate the aircraft weight at each waypoint.
+def number_of_seats(aircraft_type: str | None = None) -> int:
+    """Estimate number of seats for the provided aircraft type.
 
     Parameters
     ----------
-    aircraft_mass : ArrayOrFloat
-        Aircraft mass, [:math:`kg`]
+    aircraft_type : str
+        ICAO aircraft type designator
 
     Returns
     -------
-    ArrayOrFloat
-        Aircraft weight, [:math:`N`]
+    int
+        Reference values for the number of seats
     """
-    return aircraft_mass * constants.g
+    if aircraft_type is None:
+        return 0
+    lookup = _passenger_aircraft_n_seats_database(N_SEATS_PATH)
+    return lookup.get(aircraft_type, 0)
+
+
+def cargo_load_factor(
+    origin_airport_icao: str | None = None,
+    destination_airport_icao: str | None = None,
+    total_flight_dist: float | None = None,
+    passenger_aircraft: bool = True,
+) -> float:
+    """
+    Estimate cargo load factor carried by passenger aircraft and dedicated freighters.
+
+    Accounts for regional asymmetries in freight flow and distance-specific variability
+
+    Parameters
+    ----------
+    origin_airport_icao : str | None
+        ICAO code of origin airport. If None is provided, then assume global mean values.
+    destination_airport_icao : str | None
+        ICAO code of destination airport. If None is provided, then assume global mean values.
+    total_flight_dist : float
+        Total flight distance flown, [:math:`km`]
+        Use great-circle distance between first and last known waypoint for consistency with the
+        cargo database.
+    passenger_aircraft : bool
+        Use cargo load factors for the passenger hold if true, otherwise use cargo load factors for
+        dedicated freighters
+
+    Returns
+    -------
+    float
+        Passenger load factor [0 - 1], unitless
+    """
+    # If origin airport is provided, use regional load factor.
+    # Otherwise, do not allow empty string and `None` to pass
+    if origin_airport_icao:
+        first_letter = origin_airport_icao[0]
+        origin_region = AIRPORT_TO_REGION.get(first_letter, "Global")
+    else:
+        origin_region = "Global"
+
+    if destination_airport_icao:
+        first_letter = destination_airport_icao[0]
+        destination_region = AIRPORT_TO_REGION.get(first_letter, "Global")
+    else:
+        destination_region = "Global"
+
+    # If either origin or destination is None, both become `Global` because no data is available for
+    # regional -> global, or global -> regional
+    if origin_region == "Global" or destination_region == "Global":
+        origin_region = "Global"
+        destination_region = "Global"
+
+    # Load Dray et al. (2024) cargo database
+    clf_database = _dray_cargo_load_factor_database(CLF_PATH)
+
+    # Filter for region of interest
+    rows = clf_database.query("origin == @origin_region and destination == @destination_region")
+    if rows.empty:
+        logger.debug(
+            "No cargo load factor data found for origin region %s and destination region %s. "
+            "Assuming global mean values.",
+            origin_region,
+            destination_region,
+        )
+        rows = clf_database.query("origin == 'Global' and destination == 'Global'")
+
+    rows = rows.sort_values(by="dist_mid")
+
+    # If distance is not provided, then try to estimate with origin and destination airport pairs
+    if total_flight_dist is None and origin_airport_icao and destination_airport_icao:
+        airports = global_airport_database()
+        total_flight_dist = distance_between_airports(
+            airports,
+            origin_airport_icao,
+            destination_airport_icao,
+        )
+
+    # If `total_flight_dist` is still None, assume 2019 global annual mean values
+    if total_flight_dist is None:
+        if passenger_aircraft:
+            return (
+                rows["pax_hold_freight_carried_tonnes"].sum()
+                / rows["pax_hold_freight_capacity_tonnes"].sum()
+            )
+        return (
+            rows["dedicated_freight_carried_tonnes"].sum()
+            / rows["dedicated_freight_capacity_tonnes"].sum()
+        )
+
+    # Otherwise, query cargo database
+    xp_clf = rows["dist_mid"]
+    if passenger_aircraft:
+        fp_clf = rows["mean_passenger_hold_freight_lf"]
+    else:
+        fp_clf = rows["mean_dedicated_freight_lf"]
+
+    return np.interp(total_flight_dist, xp_clf, fp_clf).item()
+
+
+def passenger_aircraft_payload(
+    max_payload: float, n_seats: int, pax_lf: float, cargo_lf: float, *, pax_mass: float = 100.0
+) -> float:
+    """Estimate payload for passenger aircraft.
+
+    Parameters
+    ----------
+    max_payload: float
+        Aircraft maximum payload, [:math:`kg`]
+    n_seats: int
+        Total number of seats in passenger aircraft
+    pax_lf: float
+        Passenger load factor (between 0 and 1).
+        Refer to :func:`passenger_load_factor` for historical regional-specific values.
+    cargo_lf: float
+        Cargo load factor in the passenger hold (between 0 and 1).
+        Refer to :func:`cargo_load_factor` for origin-destination specific reference values.
+    pax_mass: float
+        Assumed passenger plus baggage mass, [:math:`kg`]
+        Defaults to the ICAO-recommend value of 100 kg
+
+    Returns
+    -------
+    float
+        Estimated passenger aircraft payload, [:math:`kg`]
+
+    References
+    ----------
+    - :cite: Dray et al. (2024), https://doi.org/10.1016/j.jairtraman.2024.102692
+    """
+    # Estimate maximum cargo payload: Assume 100% passenger load factor
+    max_cargo_payload = max_payload - (n_seats * pax_mass)
+
+    # Estimate passenger payload,
+    pax_payload = n_seats * pax_lf * pax_mass
+
+    # Estimate cargo payload
+    cargo_payload = cargo_lf * max_cargo_payload
+    return pax_payload + cargo_payload
+
+
+def dedicated_freighter_payload(
+    max_payload: float,
+    cargo_lf: float,
+) -> float:
+    """Estimate payload for passenger aircraft.
+
+    Parameters
+    ----------
+    max_payload: float
+        Aircraft maximum payload, [:math:`kg`]
+    cargo_lf: float
+        Cargo load factor for dedicated freighters (between 0 and 1). Refer to
+        :func:`cargo_load_factor` for origin-destination specific reference values.
+
+    Returns
+    -------
+    float
+        Estimated cargo aircraft payload, [:math:`kg`]
+
+    References
+    ----------
+    - :cite: Teoh et al. (2026), in preparation
+    """
+    return max_payload * cargo_lf
+
+
+def aircraft_payload(
+    *,
+    max_payload: float,
+    aircraft_role: str = "Passenger",
+    n_seats: int = 0,
+    pax_lf: float = 0.80,
+    pax_mass: float = 100.0,
+    cargo_lf: float = 0.20,
+) -> float:
+    """Estimate the payload mass based on the aircraft role.
+
+    Parameters
+    ----------
+    max_payload: float
+        Aircraft maximum payload, [:math:`kg`]
+    aircraft_role: str
+        Aircraft role, i.e., "Passenger", "Cargo", "Others", etc.
+        Assumes passenger aircraft (i.e., "Passenger") by default. For dedicated freighters, the
+        aircraft role should be set to "Cargo".
+    n_seats: int
+        Total number of seats in passenger aircraft
+    pax_lf: float
+        Passenger load factor (between 0 and 1).
+        Refer to :func:`passenger_load_factor` for historical values. Otherwise, defaults to 0.8
+    pax_mass: float
+        Assumed passenger plus baggage mass, [:math:`kg`]
+        Defaults to the ICAO-recommend value of 100 kg
+    cargo_lf: float
+        Cargo load factor (between 0 and 1)
+        For "Passenger" aircraft, this is the assumed cargo load factor in the passenger hold. For
+        "Cargo" aircraft, this is the assumed cargo load factor for dedicated freighters. Refer to
+        :func:`cargo_load_factor` for reference values for passenger aircraft and freighters.
+
+    Returns
+    -------
+    float
+        Estimated aircraft payload, [:math:`kg`]
+
+    References
+    ----------
+    - :cite: Teoh et al. (2026), in preparation
+    - :cite: Dray et al. (2024), https://doi.org/10.1016/j.jairtraman.2024.102692
+    """
+    # For passenger aircraft with `n_seats` > 30 (guardrails)
+    if aircraft_role == "Passenger" and n_seats > 30:
+        return passenger_aircraft_payload(max_payload, n_seats, pax_lf, cargo_lf, pax_mass=pax_mass)
+
+    # For dedicated freighters
+    if aircraft_role == "Cargo":
+        return dedicated_freighter_payload(max_payload, cargo_lf)
+
+    # For non-passenger and non-cargo aircraft, assume 70% of maximum payload
+    return 0.70 * max_payload
 
 
 def initial_aircraft_mass(
     *,
-    operating_empty_weight: float,
-    max_takeoff_weight: float,
-    max_payload: float,
+    amass_oew: float,
+    amass_mtow: float,
+    payload: float,
     total_fuel_burn: float,
     total_reserve_fuel: float,
-    load_factor: float,
+    oew_uplift: float = 1.03,
 ) -> float:
     """Estimate initial aircraft mass as a function of load factor and fuel requirements.
 
     This function uses the following equation::
 
-        TOM = OEM + PM + FM_nc + TFM
-            = OEM + LF * MPM + FM_nc + TFM
+        TOM = (OEM * OEM_uplift) + PM + FM_res + TFM
+        TOM = min(TOM, MTOW)
 
     where:
     - TOM is the aircraft take-off mass
     - OEM is the aircraft operating empty weight
+    - OEM_uplift is a multiple applied to the operating empty weight to account for biases
     - PM is the payload mass
-    - FM_nc is the mass of the fuel not consumed
+    - FM_res is the mass of the reserve fuel
     - TFM is the trip fuel mass
-    - LF is the load factor
-    - MPM is the maximum payload mass
+    - MTOW is the aircraft maximum take-off weight
 
     Parameters
     ----------
-    operating_empty_weight: float
+    amass_oew: float
         Aircraft operating empty weight, i.e. the basic weight of an aircraft including
         the crew and necessary equipment, but excluding usable fuel and payload, [:math:`kg`]
-    max_takeoff_weight: float
+    amass_mtow: float
         Aircraft maximum take-off weight, [:math:`kg`]
-    max_payload: float
-        Aircraft maximum payload, [:math:`kg`]
+    payload: float
+        Aircraft payload, [:math:`kg`]
     total_fuel_burn: float
         Total fuel consumption for the flight, obtained from prior iterations, [:math:`kg`]
     total_reserve_fuel: float
         Total reserve fuel requirements, [:math:`kg`]
-    load_factor: float
-        Aircraft load factor assumption (between 0 and 1)
+    oew_uplift: float
+        Multiple to increase operational empty weight. Defaults to 1.03, following Cirium (2025).
 
     Returns
     -------
@@ -539,24 +805,24 @@ def initial_aircraft_mass(
     References
     ----------
     - :cite:`wasiukAircraftPerformanceModel2015`
+    - Cirium EmeraldSky Emissions Methodology 2025: Detailed Description v1.8, p. 9.
+    https://assets.fta.cirium.com/wp-content/uploads/2025/11/11122423/Cirium-EmeraldSky-Emissions-Methodology-2025-Detailed-Description-v1.8.pdf
 
     See Also
     --------
-    reserve_fuel_requirements
-    aircraft_load_factor
+    :func:`reserve_fuel_requirements`
     """
-    tom = operating_empty_weight + load_factor * max_payload + total_fuel_burn + total_reserve_fuel
-    return min(tom, max_takeoff_weight)
+    tom = (amass_oew * oew_uplift) + payload + total_fuel_burn + total_reserve_fuel
+    return min(tom, amass_mtow)
 
 
 def update_aircraft_mass(
     *,
-    operating_empty_weight: float,
-    max_takeoff_weight: float,
-    max_payload: float,
+    amass_oew: float,
+    amass_mtow: float,
+    payload: float,
     fuel_burn: npt.NDArray[np.floating],
     total_reserve_fuel: float,
-    load_factor: float,
     takeoff_mass: float | None,
 ) -> npt.NDArray[np.floating]:
     """Update aircraft mass based on the simulated total fuel consumption.
@@ -565,22 +831,19 @@ def update_aircraft_mass(
 
     Parameters
     ----------
-    operating_empty_weight: float
+    amass_oew: float
         Aircraft operating empty weight, i.e. the basic weight of an aircraft including
         the crew and necessary equipment, but excluding usable fuel and payload, [:math:`kg`].
     ref_mass: float
         Aircraft reference mass, [:math:`kg`].
-    max_takeoff_weight: float
+    amass_mtow: float
         Aircraft maximum take-off weight, [:math:`kg`].
-    max_payload: float
-        Aircraft maximum payload, [:math:`kg`]
+    payload: float
+        Aircraft payload, [:math:`kg`]
     fuel_burn: npt.NDArray[np.floating]
         Fuel consumption for each waypoint, [:math:`kg`]
     total_reserve_fuel: float
         Total reserve fuel requirements, [:math:`kg`]
-    load_factor: float
-        Aircraft load factor assumption (between 0 and 1). This is the ratio of the
-        actual payload weight to the maximum payload weight.
     takeoff_mass: float | None
         Initial aircraft mass, [:math:`kg`]. If None, the initial mass is calculated
         using :func:`initial_aircraft_mass`. If supplied, all other parameters except
@@ -600,12 +863,11 @@ def update_aircraft_mass(
     """
     if takeoff_mass is None:
         takeoff_mass = initial_aircraft_mass(
-            operating_empty_weight=operating_empty_weight,
-            max_takeoff_weight=max_takeoff_weight,
-            max_payload=max_payload,
+            amass_oew=amass_oew,
+            amass_mtow=amass_mtow,
+            payload=payload,
             total_fuel_burn=np.nansum(fuel_burn).item(),
             total_reserve_fuel=total_reserve_fuel,
-            load_factor=load_factor,
         )
 
     # Calculate updated aircraft mass for each waypoint

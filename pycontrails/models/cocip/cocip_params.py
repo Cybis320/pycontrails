@@ -12,7 +12,9 @@ import numpy.typing as npt
 
 from pycontrails.core.aircraft_performance import AircraftPerformance
 from pycontrails.core.models import AdvectionBuffers
+from pycontrails.models.emissions import Emissions
 from pycontrails.models.emissions.emissions import EmissionsParams
+from pycontrails.models.extended_k15 import Particle, ParticleType
 from pycontrails.models.humidity_scaling import HumidityScaling
 
 
@@ -176,6 +178,13 @@ class CocipParams(AdvectionBuffers):
     #: Denoted :math:`C_{D0}` in eq (14) in :cite:`schumannContrailCirrusPrediction2012`.
     initial_wake_vortex_depth: float = 0.5
 
+    #: Turbulent vertical velocity scale, [:math:`m s^{-1}`]. Equivalent to :math:`\sqrt{c_V} w_N'`
+    #: in eq. (35) of :cite:`schumannContrailCirrusPrediction2012`.
+    #: The default value is based on :cite:`schumannAviationinducedCirrusRadiation2013`
+    #: and is higher than the value derived from :math:`c_V = 0.2` and :math:`w_N' = 0.1` m s^{-1}
+    #: in the original publication.
+    turbulent_vertical_velocity_scale: float = 0.1
+
     #: Sedimentation impact factor. Denoted by :math:`f_{T}` in eq. (35) of
     #: :cite:`schumannContrailCirrusPrediction2012`.
     #: Schumann describes this as "an important adjustable parameter", and sets
@@ -201,8 +210,22 @@ class CocipParams(AdvectionBuffers):
     #: Upper bound for contrail plume depth, constraining it to realistic values.
     #: CoCiP only uses the ambient conditions at the mid-point of the Gaussian plume,
     #: and the edges could be in subsaturated conditions and sublimate. Important when
-    #: :attr:`radiative_heating_effects` is enabled.
-    max_depth: float = 1500.0
+    #: :attr:`radiative_heating_effects` is enabled. Set to ``None`` to disable.
+    max_depth: float | None = 1500.0
+
+    #: Upper bound for contrail horizontal plume diffusivities, [:math:`m^{2} s^{-1}`]
+    #: Set as ``None`` for now. Optional to set it to 100.0.
+    #: See Section 2.2 of Schumann & Seifert (2025), https://doi.org/10.5194/acp-25-18571-2025
+    #:
+    #:  .. versionadded:: 0.60.2
+    max_horizontal_diffusivity: float | None = None
+
+    #: Upper bound for contrail vertical plume diffusivities, [:math:`m^{2} s^{-1}`]
+    #: Set as ``None`` for now. Optional to set it to 10.0.
+    #: See Section 2.2 of Schumann & Seifert (2025), https://doi.org/10.5194/acp-25-18571-2025
+    #:
+    #:  .. versionadded:: 0.60.2
+    max_vertical_diffusivity: float | None = None
 
     #: Experimental. Improved ice crystal number survival fraction in the wake vortex phase.
     #: Implement :cite:`lottermoserHighResolutionEarlyContrails2025`, who developed a
@@ -224,10 +247,54 @@ class CocipParams(AdvectionBuffers):
     radiative_heating_effects: bool = False
 
     #: Experimental. Apply the extended K15 model to account for vPM activation.
-    #: See the preprint `<https://doi.org/10.5194/egusphere-2025-1717>`_ for details.
+    #: See the Ponsonby et al. `<https://doi.org/10.5194/acp-25-18617-2025>`_ for details.
     #:
     #: .. versionadded:: 0.55.0
     vpm_activation: bool = False
+
+    #: Assumed vPM properties for rich-burn engines if :attr:`vpm_activation` is enabled.
+    #: ::
+    #:
+    #:     vPM = Fuel sulphur content of 500 ppm + EI organics of 5 mg/kg
+    #:
+    #: Beta and subject to change (Teoh et al., 2026, in preparation).
+    #:
+    #: .. versionadded:: 0.60.5
+    particles_rich_burn: tuple[Particle, ...] = (
+        Particle(type=ParticleType.NVPM, gmd=30.0e-9, gsd=2.0, kappa=0.005),
+        Particle(type=ParticleType.VPM, gmd=1.95e-9, gsd=1.40, kappa=0.54, ei_vpm=1e17),
+        Particle(type=ParticleType.AMBIENT, gmd=30.0e-9, gsd=2.2, kappa=0.5, n_ambient=600.0e6),
+    )
+
+    #: Assumed vPM properties for lean-burn engines if :attr:`vpm_activation` is enabled.
+    #: ::
+    #:
+    #:     Mixed vPM = Fuel sulphur content of 500 ppm + EI organics of 5 mg/kg
+    #:     + nominal lubrication oil (informed by Boeing ecoDemonstrator and VOLCAN campaigns)
+    #:
+    #: Beta and subject to change (Teoh et al., 2026, in preparation).
+    #:
+    #: .. versionadded:: 0.60.5
+    particles_lean_burn: tuple[Particle, ...] = (
+        Particle(type=ParticleType.NVPM, gmd=30.0e-9, gsd=2.0, kappa=0.005),
+        Particle(type=ParticleType.VPM, gmd=9.55e-9, gsd=1.40, kappa=0.33, ei_vpm=1.4e15),
+        Particle(type=ParticleType.AMBIENT, gmd=30.0e-9, gsd=2.2, kappa=0.5, n_ambient=600.0e6),
+    )
+
+    #: Experimental. Alternative contrail parametric radiative forcing model.
+    #: The original parametric RF model (Schumann et al., 2012) assumes a near-linear dependence of
+    #: contrail RF on the contrail and natural cirrus optical depth. However, the ECMWF ecRad model
+    #: suggests a stronger nonlinear dependence. Schumann (2025) introduces an alternative
+    #: formulation to allow for stronger RF non-linearity. The original formulation remains the
+    #: best fit to the libRadtran dataset with the minimum number of model coefficients, while the
+    #: alternative formulation yields a slightly weaker regression fit.
+    #:
+    #: See the Schumann (2025) `<https://doi.org/10.5281/zenodo.17241725>`_, `mo_rf.f90` in
+    #: Schumann (2025) `<https://doi.org/10.5281/zenodo.17581102>`_, and Figure 8 of Schumann &
+    #: Seifert (2025), `<https://doi.org/10.5194/acp-25-18571-2025>`_.
+    #:
+    #:  .. versionadded:: 0.61.0
+    parametric_rf_model_s2025: bool = False
 
     #: Experimental. Radiative effects due to contrail-contrail overlapping
     #: Account for change in local contrail shortwave and longwave radiative forcing
@@ -266,6 +333,15 @@ class CocipParams(AdvectionBuffers):
     #: Primarily used to support uncertainty estimation.
     rf_lw_enhancement_factor: float = 1.0
 
+    #: Experimental: use revised contrail ice budget (to be described in a forthcoming paper).
+    #: In brief, the revised ice budget includes tendencies associated with sedimentation across an
+    #: ambient humidity gradient and ensures that contrails conserve total ice when in air at 100%
+    #: RHi. This feature should be activated with caution, as it changes the optical properties of
+    #: aged contrails and lead to significant increases in contrail radiative forcing.
+    #:
+    #:  .. versionadded:: 0.62.0
+    revised_contrail_ice_budget: bool = False
+
     # ---------------------------------------
     # Conditions for end of contrail lifetime
     # ---------------------------------------
@@ -295,6 +371,10 @@ class CocipParams(AdvectionBuffers):
 
     #: Maximum contrail ice particle number per volume of air to prevent unrealistic values.
     max_n_ice_per_m3: float = 1e20
+
+    #: Use a custom :class:`Emissions` model to calculate aircraft emissions.
+    #: By default, a new :class:`Emissions` model is created during CoCiP evaluation.
+    emissions: Emissions | None = None
 
 
 @dataclasses.dataclass

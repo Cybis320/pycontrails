@@ -9,8 +9,9 @@ from typing import Any, Generic, NoReturn, overload
 
 import numpy as np
 import numpy.typing as npt
+import pandas as pd
 
-from pycontrails.core import flight, fuel
+from pycontrails.core import aircraft_spec, flight, fuel
 from pycontrails.core.fleet import Fleet
 from pycontrails.core.flight import Flight
 from pycontrails.core.met import MetDataset
@@ -19,12 +20,6 @@ from pycontrails.core.models import Model, ModelParams, interpolate_met
 from pycontrails.core.vector import GeoVectorDataset
 from pycontrails.physics import jet
 from pycontrails.utils.types import ArrayOrFloat
-
-#: Default load factor for aircraft performance models.
-#: See :func:`pycontrails.physics.jet.aircraft_load_factor`
-#: for a higher precision approach to estimating the load factor.
-DEFAULT_LOAD_FACTOR = 0.83
-
 
 # --------------------------------------
 # Trajectory aircraft performance models
@@ -40,6 +35,8 @@ class CommonAircraftPerformanceParams:
     #: Reference:
     #: Gurrola Arrieta, M.D.J., Botez, R.M. and Lasne, A., 2024. An Engine Deterioration Model for
     #: Predicting Fuel Consumption Impact in a Regional Aircraft. Aerospace, 11(6), p.426.
+    #: If the age of the aircraft is known, the :func`engine_deterioration_factor_from_age`
+    #: function will be used to determine the engine deterioration factor.
     engine_deterioration_factor: float = 0.025
 
 
@@ -69,6 +66,14 @@ class AircraftPerformanceParams(ModelParams, CommonAircraftPerformanceParams):
     #: In the case that ``met`` is not provided, any missing values are
     #: filled with zero wind.
     fill_low_altitude_with_zero_wind: bool = False
+
+    #: Add or reduce the maximum permitted Mach number guardrail. This
+    #: parameter buffers the aircraft max Mach number by an additional amount.
+    #:
+    #: .. versionadded:: 0.63.0
+    #:
+    #:    Previously this parameter was hard-coded. Default now changed from 0.02 to 0.0
+    max_mach_buffer: float = 0.0
 
 
 class AircraftPerformance(Model):
@@ -161,6 +166,106 @@ class AircraftPerformance(Model):
         - ``total_fuel_burn``: total fuel burn, [:math:`kg`]
         """
 
+    def get_engine_deterioration_factor(self, fl: Flight, aircraft_type: str) -> float:
+        """Determine the engine deterioration factor based on the age of the aircraft if possible.
+
+        This simple method is provided to avoid some repetition in the implementing classes.
+
+        The priority for determining the engine deterioration factor is as follows:
+
+        1. If ``fl.attrs["engine_deterioration_factor"]`` is already set, use that value.
+        2. If ``fl.attrs["aircraft_age_yrs"]`` is set, call
+           :func:`engine_deterioration_factor_from_age` to determine the engine deterioration
+           factor based on the age of the aircraft.
+        3. Otherwise, use the default value from :attr:`params`.
+
+        Parameters
+        ----------
+        fl : Flight
+            Flight trajectory to evaluate. The ``fl.attrs`` is updated in-place with the
+            computed engine deterioration factor if it is not already set.
+        aircraft_type : str
+            The ICAO aircraft type. Likely the same as ``fl.attrs["aircraft_type"]``,
+            but passed explicitly to avoid circular dependencies between the model
+            and the flight attributes.
+
+        Returns
+        -------
+        float
+            Engine deterioration factor as a fraction of fuel flow increase.
+        """
+        out = fl.attrs.get("engine_deterioration_factor")
+        if out is not None:
+            return out
+
+        default = self.params["engine_deterioration_factor"]
+
+        aircraft_age_yrs = fl.get_constant("aircraft_age_yrs", None)
+        if aircraft_age_yrs is not None and not np.isnan(aircraft_age_yrs):
+            out = engine_deterioration_factor_from_age(aircraft_age_yrs, aircraft_type, default)
+        else:
+            out = default
+
+        fl.attrs["engine_deterioration_factor"] = out
+        return out
+
+    def estimate_payload(self, fl: Flight, aircraft_type: str, max_payload: float) -> float:
+        """Estimate the payload for a flight.
+
+        This method looks for the following attributes in ``fl.attrs`` to determine the payload.
+        If any of these attributes are missing, they are estimated and added to ``fl.attrs``.
+        - ``payload``
+        - ``aircraft_role``
+        - ``n_seats``
+        - ``passenger_load_factor``
+        - ``cargo_load_factor``
+        """
+        if (out := fl.attrs.get("payload")) is not None:
+            return out
+
+        aircraft_role = fl.attrs.get("aircraft_role")
+        if aircraft_role is None:
+            aircraft_role = "Passenger"
+            fl.attrs["aircraft_role"] = aircraft_role
+
+        n_seats = fl.attrs.get("n_seats")
+        if n_seats is None:
+            n_seats = jet.number_of_seats(aircraft_type)
+            fl.attrs["n_seats"] = n_seats
+
+        pax_lf = fl.attrs.get("passenger_load_factor")
+        if pax_lf is None:
+            origin_airport_icao = fl.attrs.get("origin_airport_icao")
+            first_waypoint_time = pd.Timestamp(fl.data["time"][0]) if fl else None
+            pax_lf = jet.passenger_load_factor(origin_airport_icao, first_waypoint_time)
+            fl.attrs["passenger_load_factor"] = pax_lf
+
+        cargo_lf = fl.attrs.get("cargo_load_factor")
+        if cargo_lf is None:
+            origin_airport_icao = fl.attrs.get("origin_airport_icao")
+            destination_airport_icao = fl.attrs.get("destination_airport_icao")
+            if origin_airport_icao is None or destination_airport_icao is None:
+                total_flight_dist = np.nansum(fl.segment_haversine()).item()
+            else:
+                total_flight_dist = None
+            cargo_lf = jet.cargo_load_factor(
+                origin_airport_icao,
+                destination_airport_icao,
+                total_flight_dist,
+                aircraft_role == "Passenger",
+            )
+            fl.attrs["cargo_load_factor"] = cargo_lf
+
+        out = jet.aircraft_payload(
+            max_payload=max_payload,
+            aircraft_role=aircraft_role,
+            n_seats=n_seats,
+            pax_lf=pax_lf,
+            cargo_lf=cargo_lf,
+        )
+        fl.attrs["payload"] = out
+        return out
+
     def simulate_fuel_and_performance(
         self,
         *,
@@ -178,7 +283,7 @@ class AircraftPerformance(Model):
         amass_oew: float,
         amass_mtow: float,
         amass_mpl: float,
-        load_factor: float,
+        payload: float,
         takeoff_mass: float | None,
         **kwargs: Any,
     ) -> AircraftPerformanceData:
@@ -224,15 +329,12 @@ class AircraftPerformance(Model):
             Aircraft maximum payload, [:math:`kg`]. Used to determine
             the initial aircraft mass if ``takeoff_mass`` is not provided.
             This quantity is constant for a given aircraft type.
-        load_factor : float
-            Aircraft load factor assumption (between 0 and 1). If unknown,
-            a value of 0.7 is a reasonable default. Typically, this parameter
-            is between 0.6 and 0.8. During the height of the COVID-19 pandemic,
-            this parameter was often much lower.
+        payload : float
+            Aircraft payload, [:math:`kg`]. See :meth:`estimate_payload` for methodology.
         takeoff_mass : float | None, optional
             If known, the takeoff mass can be provided to skip the calculation
             in :func:`jet.initial_aircraft_mass`. In this case, the parameters
-            ``load_factor``, ``amass_oew``, ``amass_mtow``, and ``amass_mpl`` are
+            ``payload``, ``amass_oew``, ``amass_mtow``, and ``amass_mpl`` are
             ignored.
         **kwargs : Any
             Additional keyword arguments are passed to :meth:`calculate_aircraft_performance`.
@@ -273,7 +375,7 @@ class AircraftPerformance(Model):
             amass_oew=amass_oew,
             amass_mtow=amass_mtow,
             amass_mpl=amass_mpl,
-            load_factor=load_factor,
+            payload=payload,
             takeoff_mass=takeoff_mass,
             **kwargs,
         )
@@ -345,21 +447,20 @@ class AircraftPerformance(Model):
         n_iter: int,
         amass_oew: float,
         amass_mtow: float,
-        amass_mpl: float,
-        load_factor: float,
+        payload: float,
         takeoff_mass: float | None,
         **kwargs: Any,
     ) -> AircraftPerformanceData:
         # Variable aircraft_mass will change dynamically after each iteration
-        # Set the initial aircraft mass depending on a possible load factor
 
+        # Set the initial aircraft mass depending on a possible load factor
         aircraft_mass: npt.NDArray[np.floating] | float
         if takeoff_mass is not None:
             aircraft_mass = takeoff_mass
         else:
             # The initial aircraft mass gets updated at each iteration
-            # The exact value here is not important
-            aircraft_mass = amass_oew + load_factor * (amass_mtow - amass_oew)
+            # The exact value here is not important, hence the crude hard-coded estimate
+            aircraft_mass = amass_oew + 0.8 * (amass_mtow - amass_oew)
 
         for _ in range(n_iter):
             aircraft_performance = self.calculate_aircraft_performance(
@@ -392,12 +493,11 @@ class AircraftPerformance(Model):
             )
 
             aircraft_mass = jet.update_aircraft_mass(
-                operating_empty_weight=amass_oew,
-                max_takeoff_weight=amass_mtow,
-                max_payload=amass_mpl,
+                amass_oew=amass_oew,
+                amass_mtow=amass_mtow,
+                payload=payload,
                 fuel_burn=aircraft_performance.fuel_burn,
                 total_reserve_fuel=tot_reserve_fuel,
-                load_factor=load_factor,
                 takeoff_mass=takeoff_mass,
             )
 
@@ -661,7 +761,7 @@ def _fill_low_altitude_with_isa_temperature(vector: GeoVectorDataset, met_level_
     necessarily extend to the surface. This function fills points below the
     lowest altitude in the gridded data with ISA temperature values.
 
-    This function operates in-place and modifies the ``air_temperature`` field.
+    This function operates in-place by replacing the ``air_temperature`` field of ``vector``.
 
     Parameters
     ----------
@@ -675,5 +775,49 @@ def _fill_low_altitude_with_isa_temperature(vector: GeoVectorDataset, met_level_
     low_alt = vector.level > met_level_max
     cond = is_nan & low_alt
 
+    if not cond.any():
+        return
+
     t_isa = vector.T_isa()
-    air_temperature[cond] = t_isa[cond]
+    air_temperature = np.where(cond, t_isa, air_temperature)
+    vector.update(air_temperature=air_temperature)
+
+
+def engine_deterioration_factor_from_age(
+    age_years: float,
+    aircraft_type: str,
+    default: float = 0.025,
+) -> float:
+    """Calculate the engine deterioration factor based on the age of the aircraft engine.
+
+    .. versionadded:: 0.60.5
+
+    Parameters
+    ----------
+    age_years : float
+        Age of the aircraft engine in years.
+    aircraft_type : str
+        The ICAO aircraft type. Used to determine whether to apply the narrow-body
+        or wide-body engine deterioration factor.
+    default : float, optional
+        Default engine deterioration factor to use if the ``aircraft_type`` is not recognized.
+
+    Returns
+    -------
+    float
+        Engine deterioration factor as a fraction of fuel flow increase.
+
+    References
+    ----------
+    Cirium EmeraldSky Emissions Methodology 2025: Detailed Description v1.8, p. 9.
+    https://assets.fta.cirium.com/wp-content/uploads/2025/11/11122423/Cirium-EmeraldSky-Emissions-Methodology-2025-Detailed-Description-v1.8.pdf
+    """
+    if aircraft_type in aircraft_spec.NARROW_BODY_AIRCRAFT:
+        fp = [1.0, 1.02, 1.04, 1.05, 1.06]
+    elif aircraft_type in aircraft_spec.WIDE_BODY_AIRCRAFT:
+        fp = [1.005, 1.01, 1.015, 1.018, 1.02]
+    else:
+        return default
+
+    xp = [0.5, 1.5, 2.5, 6.5, 10.0]
+    return np.interp(age_years, xp, fp, left=fp[0], right=fp[-1]).item() - 1.0

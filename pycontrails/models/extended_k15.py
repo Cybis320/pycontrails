@@ -7,21 +7,23 @@ A preprint is available :cite:`ponsonbyUpdatedMicrophysicalModel2025`.
 
 import dataclasses
 import enum
+import functools
+import os
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import numpy.typing as npt
 import scipy.optimize
 import scipy.special
+from scipy.interpolate import RegularGridInterpolator
 
 from pycontrails.physics import constants, thermo
 
 # See upcoming Teoh et. al paper "Impact of Volatile Particulate Matter on Global Contrail
 # Radiative Forcing and Mitigation Assessment" for details on these default parameters.
-DEFAULT_VPM_EI_N = 2.0e17  # vPM number emissions index, [kg^-1]
 DEFAULT_EXHAUST_T = 600.0  # Exhaust temperature, [K]
-EXPERIMENTAL_WARNING = True
+EXPERIMENTAL_WARNING = not os.getenv("PYCONTRAILS_SILENCE_VPM_WARNING")
 
 
 class ParticleType(enum.StrEnum):
@@ -51,6 +53,10 @@ class Particle:
         For ambient or background particles, this specifies the number
         concentration entrained in the contrail plume. For emission particles,
         this should be set to ``0.0``.
+    ei_vpm : float
+        Volatile particulate matter (vPM) emissions index number, [:math:`kg^{-1}`].
+        For vPM particles, this specifies the number of vPM particles emitted
+        per kilogram of fuel burned. For non-vPM particles, this should be set to ``0.0``.
 
     Notes
     -----
@@ -62,27 +68,28 @@ class Particle:
     kappa: float
     gmd: float
     gsd: float
-    n_ambient: float
+    n_ambient: float = 0.0
+    ei_vpm: float = 0.0
 
     def __post_init__(self) -> None:
         ptype = self.type
+        if ptype == ParticleType.AMBIENT and self.n_ambient <= 0.0:
+            raise ValueError("n_ambient must be positive for ParticleType.AMBIENT")
+        if ptype == ParticleType.VPM and self.ei_vpm <= 0.0:
+            raise ValueError("ei_vpm must be positive for ParticleType.VPM")
         if ptype != ParticleType.AMBIENT and self.n_ambient:
-            raise ValueError(f"n_ambient must be 0 for aircraft-emitted {ptype.value} particles")
-        if ptype == ParticleType.AMBIENT and self.n_ambient < 0.0:
-            raise ValueError("n_ambient must be non-negative for ambient particles")
+            raise ValueError("n_ambient must be 0 for ParticleType.NVPM and ParticleType.VPM")
+        if ptype != ParticleType.VPM and self.ei_vpm:
+            raise ValueError("ei_vpm must be 0 for ParticleType.NVPM and ParticleType.AMBIENT")
 
+    @property
+    def to_json(self) -> dict[str, float | str]:
+        """Return a JSON-serializable representation of the Particle instance.
 
-def _default_particles() -> list[Particle]:
-    """Define particle types representing nvPM, vPM, and ambient particles.
-
-    See upcoming Teoh et. al paper "Impact of Volatile Particulate Matter on Global Contrail
-    Radiative Forcing and Mitigation Assessment" for details on these default parameters.
-    """
-    return [
-        Particle(type=ParticleType.NVPM, kappa=0.005, gmd=30.0e-9, gsd=2.0, n_ambient=0.0),
-        Particle(type=ParticleType.VPM, kappa=0.2, gmd=1.8e-9, gsd=1.5, n_ambient=0.0),
-        Particle(type=ParticleType.AMBIENT, kappa=0.5, gmd=30.0e-9, gsd=2.3, n_ambient=600.0e6),
-    ]
+        This serves to make :class:`Particle` compatible
+        with :class:`pycontrails.utils.json.NumpyEncoder`.
+        """
+        return dataclasses.asdict(self)
 
 
 @dataclasses.dataclass
@@ -344,9 +351,9 @@ def activation_radius(
         to form a water droplet in the emissions plume.
 
     """
-    cond = S_w > 1.0
     S_w, kappa, temperature = np.broadcast_arrays(S_w, kappa, temperature)
 
+    cond = S_w > 1.0
     S_w_cond = S_w[cond]
     kappa_cond = kappa[cond]
     temperature_cond = temperature[cond]
@@ -365,6 +372,58 @@ def activation_radius(
     return out
 
 
+@functools.lru_cache(maxsize=8)
+def _activation_radius_rgi(kappa: float) -> RegularGridInterpolator:
+    """Construct ``RegularGridInterpolator`` to estimate :func:`activation_radius` for fixed kappa.
+
+    Here the grid is defined over ``log(log(S_w))`` and ``T``, and the interpolated
+    values are ``log(r_act)``. The coordinates are chosen to provide an approximation with
+    error comparable to those from the root-finding method in :func:`activation_radius`.
+
+    Results are cached for up to 8 unique ``kappa`` values.
+    """
+    log_log_S_w_coord = np.arange(-10.0, 1.0, 0.05, dtype=float)
+    S_w_coord = np.exp(np.exp(log_log_S_w_coord))
+    T_coord = np.arange(190.0, 250.0, 1.0, dtype=float)  # consistent with _t_plume_test_points
+
+    # With the above coordinates, the 2D grid below has shape (220, 60)
+    r_grid = activation_radius(S_w_coord[:, np.newaxis], kappa, T_coord[np.newaxis, :])
+
+    log_r_grid = np.log(r_grid)
+    return RegularGridInterpolator(
+        (log_log_S_w_coord, T_coord),
+        log_r_grid,
+        method="linear",
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+
+
+def _activation_radius_lookup(
+    S_w: npt.NDArray[np.floating],
+    kappa: float,
+    temperature: npt.NDArray[np.floating],
+) -> npt.NDArray[np.floating]:
+    """Approximate activation radius using a precomputed lookup table.
+
+    Unlike :func:`activation_radius`, this function can only handle a scalar ``kappa``.
+    """
+    S_w, temperature = np.broadcast_arrays(S_w, temperature)
+
+    cond = S_w > 1.0
+    S_w_cond = S_w[cond]
+    temperature_cond = temperature[cond]
+
+    rgi = _activation_radius_rgi(kappa)
+
+    # rgi uses log(log(S_w)) and T as coordinates, and returns log(r_act)
+    r_act_cond = np.exp(rgi((np.log(np.log(S_w_cond)), temperature_cond)))
+
+    out = np.full_like(S_w, np.nan)
+    out[cond] = r_act_cond
+    return out
+
+
 def _t_plume_test_points(
     specific_humidity: npt.NDArray[np.floating],
     T_ambient: npt.NDArray[np.floating],
@@ -374,11 +433,14 @@ def _t_plume_test_points(
 ) -> npt.NDArray[np.floating]:
     """Determine test points for the plume temperature along the mixing line."""
     target_shape = (1,) * T_ambient.ndim + (-1,)
-    step = 0.005
+    step = 1.0
 
-    # Initially we take a shotgun approach
-    # We could use some optimization technique here as well, but it's not obviously worth it
-    T_plume_test = np.arange(190.0, 300.0, step, dtype=float).reshape(target_shape)
+    # Initially we take a shotgun approach but with a coarse step size
+    # Decreasing the step size results in a tighter range for some points,
+    # but it can drastically increase memory usage.
+    # The upper bound of 250 K is chosen because the SAC is unlikely to hold
+    # above this temperature. We rarely encounter ambient temperatures below 190 K.
+    T_plume_test = np.arange(190.0, 250.0, step, dtype=float).reshape(target_shape)
     p_mw = thermo.water_vapor_partial_pressure_along_mixing_line(
         specific_humidity=specific_humidity[..., np.newaxis],
         air_pressure=air_pressure[..., np.newaxis],
@@ -410,12 +472,24 @@ def droplet_apparent_emission_index(
     T_exhaust: npt.NDArray[np.floating],
     air_pressure: npt.NDArray[np.floating],
     nvpm_ei_n: npt.NDArray[np.floating],
-    vpm_ei_n: float,
     G: npt.NDArray[np.floating],
-    particles: list[Particle] | None = None,
-    n_plume_points: int = 50,
+    particles: Sequence[Particle],
+    *,
+    n_plume_points: int = 40,
 ) -> npt.NDArray[np.floating]:
     """Calculate the droplet apparent emissions index from nvPM, vPM and ambient particles.
+
+    This function is the main entry point for the extended K15 model. It can be called
+    directly from the :class:`Cocip` model by enabling the ``vpm_activation`` parameter.
+
+    .. versionadded:: 0.55.0
+
+    .. versionchanged:: 0.60.2
+
+        Make implementation more memory and compute performant by constructing intermediate
+        lookup tables for the activation radius calculation. See :func:`_activation_radius_rgi`.
+        Change the default value of ``n_plume_points`` from 50 to 40. Remove the ``vpm_ei_n``
+        parameter, which is now specified per ``Particle`` instance.
 
     Parameters
     ----------
@@ -429,17 +503,18 @@ def droplet_apparent_emission_index(
         Pressure altitude at each waypoint, [:math:`Pa`]
     nvpm_ei_n : npt.NDArray[np.floating]
         nvPM number emissions index, [:math:`kg^{-1}`]
-    vpm_ei_n : float
-        vPM number emissions index, [:math:`kg^{-1}`]
     G : npt.NDArray[np.floating]
         Slope of the mixing line in a temperature-humidity diagram.
-    particles : list[Particle] | None, optional
-        List of particle types to consider. If ``None``, defaults to a list of
-        ``Particle`` instances representing nvPM, vPM, and ambient particles.
+    particles : Sequence[Particle]
+        List of particle types to consider. See
+        :attr:`pycontrails.models.cocip.CocipParams.particles_rich_burn`
+        and :attr:`pycontrails.models.cocip.CocipParams.particles_lean_burn` for
+        recommended defaults.
     n_plume_points : int
         Number of points to evaluate the plume temperature along the mixing line.
-        Increasing this value can improve accuracy. Values above 40 are typically
-        sufficient. See the :func:`droplet_activation` for numerical considerations.
+        Increasing this value can improve accuracy at the expense of compute and
+        memory cost. Values at or above 40 are typically sufficient. See
+        :func:`droplet_activation` for numerical considerations.
 
     Returns
     -------
@@ -451,7 +526,7 @@ def droplet_apparent_emission_index(
     All input arrays must be broadcastable to the same shape. For better performance
     when evaluating multiple points or grids, it is helpful to arrange the arrays so that
     meteorological variables (``specific_humidity``, ``T_ambient``, ``air_pressure``, ``G``)
-    correspond to dimension 0, while aircraft emissions (``nvpm_ei_n``, ``vpm_ei_n``) correspond
+    correspond to dimension 0, while aircraft emissions (``nvpm_ei_n``) correspond
     to dimension 1. This setup allows the plume temperature calculation to be computed once
     and reused for multiple emissions values.
 
@@ -468,19 +543,17 @@ def droplet_apparent_emission_index(
             """
         )
 
-    particles = particles or _default_particles()
-
     # Confirm all parameters are broadcastable
     specific_humidity, T_ambient, T_exhaust, air_pressure, G, nvpm_ei_n = np.atleast_1d(
         specific_humidity, T_ambient, T_exhaust, air_pressure, G, nvpm_ei_n
     )
     try:
-        np.broadcast(specific_humidity, T_ambient, T_exhaust, air_pressure, G, nvpm_ei_n, vpm_ei_n)
+        np.broadcast(specific_humidity, T_ambient, T_exhaust, air_pressure, G, nvpm_ei_n)
     except ValueError as e:
         raise ValueError(
             "Input arrays must be broadcastable to the same shape. "
             "Check the dimensions of specific_humidity, T_ambient, T_exhaust, "
-            "air_pressure, G, nvpm_ei_n, and vpm_ei_n."
+            "air_pressure, G, and nvpm_ei_n."
         ) from e
 
     # Determine plume temperature limits
@@ -515,7 +588,6 @@ def droplet_apparent_emission_index(
         T_plume=T_plume,
         T_ambient=T_ambient[..., np.newaxis],
         nvpm_ei_n=nvpm_ei_n[..., np.newaxis],
-        vpm_ei_n=vpm_ei_n,
         S_mw=S_mw,
         dilution=dilution,
         rho_air=rho_air,
@@ -661,11 +733,10 @@ def _plume_age_timescale(
 
 
 def water_droplet_activation(
-    particles: list[Particle],
+    particles: Sequence[Particle],
     T_plume: npt.NDArray[np.floating],
     T_ambient: npt.NDArray[np.floating],
     nvpm_ei_n: npt.NDArray[np.floating],
-    vpm_ei_n: float,
     S_mw: npt.NDArray[np.floating],
     dilution: npt.NDArray[np.floating],
     rho_air: npt.NDArray[np.floating],
@@ -675,7 +746,7 @@ def water_droplet_activation(
 
     Parameters
     ----------
-    particles : list[Particle]
+    particles : Sequence[Particle]
         Properties of different particles in the contrail plume.
     T_plume : npt.NDArray[np.floating]
         Plume temperature evolution along mixing line, [:math:`K`].
@@ -683,8 +754,6 @@ def water_droplet_activation(
         Ambient temperature for each waypoint, [:math:`K`].
     nvpm_ei_n : npt.NDArray[np.floating]
         nvPM number emissions index, [:math:`kg^{-1}`].
-    vpm_ei_n : float
-        vPM number emissions index, [:math:`kg^{-1}`].
     S_mw : npt.NDArray[np.floating]
         Water saturation ratio in the aircraft plume without droplet condensation.
     dilution : npt.NDArray[np.floating]
@@ -702,7 +771,7 @@ def water_droplet_activation(
     res = []
 
     for particle in particles:
-        r_act_p = activation_radius(S_mw, particle.kappa, T_plume)
+        r_act_p = _activation_radius_lookup(S_mw, particle.kappa, T_plume)
         phi_p = fraction_of_water_activated_particles(particle.gmd, particle.gsd, r_act_p)
 
         # Calculate total number concentration for a given particle type
@@ -713,7 +782,9 @@ def water_droplet_activation(
         elif particle.type == ParticleType.NVPM:
             n_total_p = emissions_index_to_number_concentration(nvpm_ei_n, rho_air, dilution, nu_0)
         elif particle.type == ParticleType.VPM:
-            n_total_p = emissions_index_to_number_concentration(vpm_ei_n, rho_air, dilution, nu_0)
+            n_total_p = emissions_index_to_number_concentration(
+                particle.ei_vpm, rho_air, dilution, nu_0
+            )
         else:
             raise ValueError("Particle type unknown")
 
@@ -1264,9 +1335,10 @@ def droplet_activation(
             "'n_plume_points' value.",
         )
 
-    # Find the first positive value, then interpolate to estimate the fractional index
-    # at which the zero crossing occurs.
-    i1 = np.argmax(f > 0.0, axis=-1, keepdims=True)
+    # Find the **last** negative-to-positive zero crossing, then interpolate to estimate
+    # the fractional index at which it occurs.
+    crossings = (f[..., :-1] <= 0.0) & (f[..., 1:] > 0.0)
+    i1 = crossings.shape[-1] - np.argmax(np.flip(crossings, axis=-1), axis=-1, keepdims=True)
     i0 = i1 - 1
     val1 = np.take_along_axis(f, i1, axis=-1)
     val0 = np.take_along_axis(f, i0, axis=-1)

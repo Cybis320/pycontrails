@@ -106,7 +106,7 @@ def test_time_input_two_times_nominal(datalib: AnyECMWFDatalibClass) -> None:
         datetime(2019, 5, 31, 3),
     ]
 
-    dl = ERA5(
+    dl = datalib(
         time=(datetime(2019, 5, 31, 0, 29), datetime(2019, 5, 31, 2, 40)),
         variables=["vo"],
         pressure_levels=[200],
@@ -625,7 +625,7 @@ def test_ERA5_set_met_source_metadata(product_type: str, variables: str) -> None
 
     assert ds.attrs["provider"] == "ECMWF"
     assert ds.attrs["dataset"] == "ERA5"
-    assert ds.attrs["product"] == product_type.split("_")[0]
+    assert ds.attrs["product"] == product_type.split("_", maxsplit=1)[0]
 
 
 @pytest.mark.usefixtures("_dask_single_threaded")

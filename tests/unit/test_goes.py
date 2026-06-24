@@ -1,5 +1,6 @@
 """Test the goes module."""
 
+import datetime
 from collections.abc import Generator
 
 import numpy as np
@@ -146,6 +147,7 @@ def goes_data() -> xr.DataArray:
     return downloader.get("2023-09-15T15:34")
 
 
+@pytest.mark.skipif(OFFLINE, reason="offline")
 def test_goes_parallax_correct_above_nadir(goes_data: xr.DataArray) -> None:
     """Test the ``parallax_correct`` function."""
     # If we're right above nadir, the parallax correction shouldn't change anything
@@ -157,6 +159,7 @@ def test_goes_parallax_correct_above_nadir(goes_data: xr.DataArray) -> None:
     assert lat0 == pytest.approx(lat1)
 
 
+@pytest.mark.skipif(OFFLINE, reason="offline")
 def test_goes_parallax_correct_due_north(goes_data: xr.DataArray) -> None:
     """Test the ``parallax_correct`` function."""
     # If we're due north, the parallax correction should shift the latitude only
@@ -168,6 +171,7 @@ def test_goes_parallax_correct_due_north(goes_data: xr.DataArray) -> None:
     assert lat1.item() == pytest.approx(44.11, abs=0.01)
 
 
+@pytest.mark.skipif(OFFLINE, reason="offline")
 def test_goes_parallax_correct_due_east(goes_data: xr.DataArray) -> None:
     """Test the ``parallax_correct`` function."""
     # If we're due east, the parallax correction should shift the longitude only
@@ -179,6 +183,7 @@ def test_goes_parallax_correct_due_east(goes_data: xr.DataArray) -> None:
     assert lon1.item() == pytest.approx(-32.90, abs=0.01)
 
 
+@pytest.mark.skipif(OFFLINE, reason="offline")
 def test_goes_parallax_correct_random(goes_data: xr.DataArray) -> None:
     """Test the ``parallax_correct`` function."""
     # In general, parallax correction doesn't shift more than +/- 0.1 degrees
@@ -194,6 +199,7 @@ def test_goes_parallax_correct_random(goes_data: xr.DataArray) -> None:
     assert np.mean(np.abs(lat0 - lat1)) == pytest.approx(0.11, abs=0.01)
 
 
+@pytest.mark.skipif(OFFLINE, reason="offline")
 def test_goes_parallax_correct_opposite_side(goes_data: xr.DataArray) -> None:
     """Test the ``parallax_correct`` function."""
 
@@ -229,3 +235,26 @@ def test_goes_19() -> None:
     assert da.dims == ("band_id", "y", "x")
     assert da.dtype == "float32"
     assert da["band_id"].values.tolist() == [2]
+
+
+@pytest.mark.skipif(OFFLINE, reason="offline")
+def test_gcs_goes_path_errors() -> None:
+    """Test errors during GCS path lookup."""
+
+    # all bands present
+    time = datetime.datetime(2025, 10, 20, 16, 0)
+    region = goes.GOESRegion.F
+    bands = ["C11", "C14", "C15"]
+    paths = goes.gcs_goes_path(time, region, bands)
+    assert len(paths) == len(bands)
+
+    # some bands missing
+    # assumes that data gap in band 11 at 2025/10/20 16:10 is permanent
+    time = datetime.datetime(2025, 10, 20, 16, 10)
+    with pytest.raises(FileNotFoundError, match="No data found"):
+        goes.gcs_goes_path(time, region, bands)
+
+    # all bands missing
+    time = datetime.datetime(1900, 1, 1, 0, 0)
+    with pytest.raises(FileNotFoundError, match="No data found"):
+        goes.gcs_goes_path(time, region, bands)

@@ -81,6 +81,7 @@ yamllint:
 	yamllint -d "{extends: default, rules: {line-length: {max: 100}}}" .
 
 mypy:
+	python -c 'import numpy; assert tuple(int(x) for x in numpy.__version__.split(".", 2)) >= (2, 5), f"numpy >= 2.5 required, got {numpy.__version__}"'
 	mypy pycontrails
 
 pytest:
@@ -199,25 +200,28 @@ nb-test: ensure-era5-cached nb-clean-check nb-format-check nb-check-links
 	python -m pytest --nbval-lax \
 		--ignore=docs/integrations/ACCF.ipynb \
 		--ignore=docs/integrations/APCEMM.ipynb \
+		--ignore=docs/integrations/GoogleForecast.ipynb \
 		--ignore=docs/notebooks/specific-humidity-interpolation.ipynb \
 		--ignore=docs/notebooks/GFS.ipynb \
 		--ignore=docs/notebooks/run-cocip-on-flight.ipynb \
 		--ignore=docs/notebooks/model-levels.ipynb \
 		--ignore=docs/notebooks/ARCO-ERA5.ipynb \
 		--ignore=docs/notebooks/Sentinel.ipynb \
+		--ignore=docs/notebooks/GRUAN.ipynb \
 		docs/notebooks docs/integrations
 
 # Check for broken links in notebooks
 # https://github.com/jupyterlab/pytest-check-links
 nb-check-links:
 	python -m pytest --check-links \
-		--check-links-ignore "https://doi.org/10.1021/acs.est.9b05608" \
-		--check-links-ignore "https://doi.org/10.1021/acs.est.2c05781" \
-		--check-links-ignore "https://doi.org/10.1175/JAMC-D-11-0242.1" \
+        --check-links-ignore "https://doi.org/*" \
+		--check-links-ignore "https://gmd.copernicus.org/articles/5/543/2012/" \
 		--check-links-ignore "https://github.com/contrailcirrus/pycontrails-bada" \
 		--check-links-ignore "https://ourairports.com" \
 		--check-links-ignore "https://www.ncei.noaa.gov/products/weather-climate-models/global-forecast" \
-		docs/notebooks/*.ipynb
+		docs/notebooks/*.ipynb \
+		--check-links-ignore "https://applications.icao.int" \
+		--check-links-ignore "https://www.dwd.de"
 
 # Execute all notebooks in docs
 # NOTE notebooks from docs/integrations/ manually

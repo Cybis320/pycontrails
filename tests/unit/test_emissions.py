@@ -8,9 +8,7 @@ import pytest
 from pycontrails import Flight
 from pycontrails.core.fuel import JetA
 from pycontrails.core.models import Model
-from pycontrails.models.emissions import Emissions, ffm2
-from pycontrails.models.emissions import black_carbon as nvpm
-from pycontrails.models.emissions import emissions as emissions_mod
+from pycontrails.models.emissions import Emissions, gaseous, nvpm
 from pycontrails.physics import jet, units
 from pycontrails.physics.jet import thrust_setting_nd
 
@@ -38,8 +36,8 @@ def test_emissions_class_variables():
     assert emissions2.edb_engine_nvpm is emissions2.edb_engine_nvpm
 
     # Update if emissions data changes
-    assert len(emissions1.edb_engine_gaseous) == 595
-    assert len(emissions1.edb_engine_nvpm) == 214
+    assert len(emissions1.edb_engine_gaseous) == 858
+    assert len(emissions1.edb_engine_nvpm) == 243
 
     # Check that the gaseous engine UIDs are a superset of the nvPM engine UIDs in the EDB.
     # This logic is used in cocip_grid.calc_emissions
@@ -67,7 +65,7 @@ def test_emissions_eval(flight_fake: Flight, bada: str, aircraft_type: str, engi
     flight_fake.attrs["aircraft_type"] = aircraft_type
     flight_fake.attrs["aircraft_type_bada"] = aircraft_type
     flight_fake.attrs["engine_uid"] = engine_uid
-    flight_fake.attrs["bada_model"] = bada
+    flight_fake.attrs["aircraft_performance_model"] = bada
     flight_fake.attrs["n_engine"] = 2
 
     out_fl = emissions.eval(source=flight_fake)
@@ -125,7 +123,7 @@ def test_emissions_eval_no_n_engine(
     flight_fake.attrs["aircraft_type"] = aircraft_type
     flight_fake.attrs["aircraft_type_bada"] = aircraft_type
     flight_fake.attrs["engine_uid"] = engine_uid
-    flight_fake.attrs["bada_model"] = bada
+    flight_fake.attrs["aircraft_performance_model"] = bada
 
     out_fl = emissions.eval(source=flight_fake)
     assert emissions.source is not flight_fake  # since copy is True
@@ -159,6 +157,107 @@ def test_emissions_eval_no_n_engine(
         out_fl = emissions.eval(flight_fake)
 
 
+def test_scope11_nvpm_emissions_profile():
+    """Test SCOPE11-estimated nvPM emissions profile
+
+    Sanity check to make sure nvPM emissions profile are reasonable.
+
+    Using the PW4168A (UID: 7PW082) because detailed nvPM mass and number emissions profiles for
+    the engine has been reported in Lobo et al. (2015), DOI: 10.1080/02786826.2015.1047012
+    """
+    engine_uid = "7PW082"  # Engine for Airbus A330-300 (PW4168A)
+    emissions = Emissions()
+    edb_gaseous = emissions.edb_engine_gaseous[engine_uid]
+
+    smoke_number = np.array(
+        [
+            edb_gaseous.sn_7,
+            edb_gaseous.sn_30,
+            edb_gaseous.sn_85,
+            edb_gaseous.sn_100,
+        ]
+    )
+    afr = np.array([106.0, 83.0, 51.0, 45.0])  # Agarwal et al. (2019)
+
+    # Check nvPM EIm
+    nvpm_ei_m_scope_est = nvpm.mass_ei_scope11(smoke_number, afr, edb_gaseous.bypass_ratio)
+    nvpm_ei_m_scope_mg = np.array([15.69, 22.36, 428.61, 424.27])  # Consistent with measurements
+    np.testing.assert_allclose(nvpm_ei_m_scope_est * 1e6, nvpm_ei_m_scope_mg, atol=0.01)
+    # Older FOX approach would give the following values: 38.0, 128.9, 591.9, 801.0 mg/kg
+    # See :func:`test_fox_fa_model_nvpm_emissions_profile`.
+
+    # Check nvPM EIn
+    average_temp = 0.5 * (edb_gaseous.temp_min + edb_gaseous.temp_max)
+    average_pressure = 0.5 * (edb_gaseous.pressure_min + edb_gaseous.pressure_max)
+    thrust_setting = np.array([0.07, 0.30, 0.85, 1.00])
+
+    nvpm_ei_n_scope_est = nvpm.number_ei_scope11(
+        nvpm_ei_m_e=nvpm_ei_m_scope_est,
+        sn=smoke_number,
+        air_temperature=average_temp,
+        air_pressure=average_pressure,
+        thrust_setting=thrust_setting,
+        afr=afr,
+        q_fuel=43.13e6,  # q_fuel not provided in `edb_gaseous`, but Jet A-1 were mainly used
+        bypass_ratio=edb_gaseous.bypass_ratio,
+        pressure_ratio=edb_gaseous.pressure_ratio,
+    )
+    nvpm_ei_n_scope = np.array([2.16, 1.36, 2.80, 2.50]) * 1e15  # Consistent with measurements
+    np.testing.assert_allclose(nvpm_ei_n_scope_est, nvpm_ei_n_scope, atol=0.01e15)
+    # Older FOX-FA approach would give the following values: 5.66, 4.94, 2.95, 2.62 kg**-1
+    # See :func:`test_fox_fa_model_nvpm_emissions_profile`.
+
+
+def test_fox_fa_model_nvpm_emissions_profile():
+    """Test FOX-FA model-estimated nvPM emissions profile.
+
+    Added this unit test to enable easier comparison with SCOPE11-estimated nvPM emissions profile.
+    See :func:`test_scope11_nvpm_emissions_profile`.
+    """
+    engine_uid = "7PW082"  # Engine for Airbus A330-300 (PW4168A)
+    emissions = Emissions()
+    edb_gaseous = emissions.edb_engine_gaseous[engine_uid]
+
+    fuel_flow = np.array(
+        [
+            edb_gaseous.ff_7,
+            edb_gaseous.ff_30,
+            edb_gaseous.ff_85,
+            edb_gaseous.ff_100,
+        ]
+    )
+
+    average_temp = 0.5 * (edb_gaseous.temp_min + edb_gaseous.temp_max)
+    average_pressure = 0.5 * (edb_gaseous.pressure_min + edb_gaseous.pressure_max)
+    thrust_setting = np.array([0.07, 0.30, 0.85, 1.00])
+
+    nvpm_ei_m_fox_est = nvpm.mass_emissions_index_fox(
+        average_pressure,
+        average_temp,
+        0.0,
+        fuel_flow,
+        thrust_setting,
+        edb_gaseous.pressure_ratio,
+    )
+    nvpm_ei_m_fox = np.array([38.03, 128.90, 591.87, 801.00]) * 1e-6  # mg/kg -> kg/kg
+    np.testing.assert_allclose(nvpm_ei_m_fox_est, nvpm_ei_m_fox, atol=0.01e-6)
+
+    nvpm_gmd_fa_est = nvpm.geometric_mean_diameter_sac(
+        average_pressure,
+        average_temp,
+        0.0,
+        thrust_setting,
+        edb_gaseous.pressure_ratio,
+        43.13e6,
+    )
+    nvpm_gmd_fa = np.array([12.02, 19.34, 39.54, 45.79]) * 1e-9  # nm -> m
+    np.testing.assert_allclose(nvpm_gmd_fa_est, nvpm_gmd_fa, atol=0.01e-9)
+
+    nvpm_ei_n_fa_est = nvpm.number_emissions_index_fractal_aggregates(nvpm_ei_m_fox, nvpm_gmd_fa)
+    nvpm_ei_n_fa = np.array([5.66, 4.94, 2.95, 2.62]) * 1e15
+    np.testing.assert_allclose(nvpm_ei_n_fa_est, nvpm_ei_n_fa, atol=0.01e15)
+
+
 def test_emissions_index_ffm2():
     """Test emissions without explicit flight.
 
@@ -178,8 +277,8 @@ def test_emissions_index_ffm2():
     edb_gaseous = emissions.edb_engine_gaseous[engine_uid]
 
     # Nitrogen oxide
-    nox_ei = emissions_mod.nitrogen_oxide_emissions_index_ffm2(
-        edb_gaseous,
+    nox_ei = gaseous.estimate_nox_ffm2(
+        edb_gaseous.log_ei_nox_profile,
         fuel_flow_per_engine_cruise,
         true_airspeed,
         air_pressure,
@@ -188,8 +287,8 @@ def test_emissions_index_ffm2():
     np.testing.assert_almost_equal(nox_ei, np.array([0.019298]), decimal=6)
 
     # Carbon monoxide (descent conditions with very low power)
-    co_ei = emissions_mod.carbon_monoxide_emissions_index_ffm2(
-        edb_gaseous,
+    co_ei = gaseous.estimate_ei_co_hc_ffm2(
+        edb_gaseous.log_ei_co_profile,
         fuel_flow_per_engine_descent,
         true_airspeed,
         air_pressure,
@@ -198,8 +297,8 @@ def test_emissions_index_ffm2():
     np.testing.assert_almost_equal(co_ei, np.array([0.028461]), decimal=6)
 
     # Hydrocarbons (descent conditions with very low power)
-    hc_ei = emissions_mod.hydrocarbon_emissions_index_ffm2(
-        edb_gaseous,
+    hc_ei = gaseous.estimate_ei_co_hc_ffm2(
+        edb_gaseous.log_ei_hc_profile,
         fuel_flow_per_engine_descent,
         true_airspeed,
         air_pressure,
@@ -222,8 +321,8 @@ def test_E45x_hydrocarbon_emissions_index() -> None:
     edb_gaseous = emissions.edb_engine_gaseous[engine_uid]
 
     # Hydrocarbons (descent conditions with very low power)
-    hc_ei = emissions_mod.hydrocarbon_emissions_index_ffm2(
-        edb_gaseous,
+    hc_ei = gaseous.estimate_ei_co_hc_ffm2(
+        edb_gaseous.log_ei_hc_profile,
         fuel_flow_per_engine_descent,
         true_airspeed,
         air_pressure,
@@ -240,7 +339,7 @@ def test_specific_humidity_correction_factor_display_45():
     p = units.m_to_pl(0) * 100
     rh = 0.6
 
-    omega = ffm2._estimate_specific_humidity(T, p, rh)
+    omega = gaseous._estimate_specific_humidity(T, p, rh)
 
     # value 0.00634 is taken from paragraph following (45)
     assert omega == pytest.approx(0.00634, abs=1e-5)
@@ -260,14 +359,14 @@ def test_example_page_11():
     ei_sl_nox = 19.43
     ei_sl_co = 0.24
 
-    omega = ffm2._estimate_specific_humidity(T, p, rh)
+    omega = gaseous._estimate_specific_humidity(T, p, rh)
     # The value 0.00053 is taken from page 11 seems to be wrong ...
     # It should actually be 0.000053
     assert omega == pytest.approx(0.000053, abs=1e-5)
 
-    q_factor = ffm2._get_humidity_correction_factor(omega)
-    nox = ffm2.ei_at_cruise(ei_sl_nox, theta_amb, delta_amb, "NOX") * q_factor
-    co = ffm2.ei_at_cruise(ei_sl_co, theta_amb, delta_amb, "CO")
+    q_factor = gaseous._get_humidity_correction_factor(omega)
+    nox = gaseous.ei_at_cruise(ei_sl_nox, theta_amb, delta_amb, "NOX") * q_factor
+    co = gaseous.ei_at_cruise(ei_sl_co, theta_amb, delta_amb, "CO")
 
     assert nox == pytest.approx(15.19, abs=1e-2)
     assert co == pytest.approx(0.50, abs=1e-2)
@@ -369,13 +468,14 @@ def test_t4_t2_cruise_estimates():
 
 
 def test_nvpm_ein_reductions_from_saf():
-    """Test ``nvpm.nvpm_number_ei_pct_reduction_due_to_saf`` with some pinned values."""
+    """Test ``nvpm.nvpm_number_fuel_correction_icao_annex_16`` with some pinned values."""
     hydrogen_mass_content = np.array([14.11, 14.15, 14.1, 14.43, 14.47, 14.58, 14.4])
     thrust_setting = np.array([0.30, 0.65, 0.85, 0.3376, 0.4284, 0.3945, np.nan])
-    d_nvpm_ein_pct = np.array([-25.55, -15.86, -7.23, -46.30, -42.34, -49.09, -37.96])
-    d_nvpm_ein_pct_est = nvpm.nvpm_number_ei_pct_reduction_due_to_saf(
+    d_nvpm_ein_pct = np.array([-20.82, -13.26, -6.06, -36.30, -34.25, -40.21, -30.42])
+    f_nvpm_ein_pct_est = nvpm.nvpm_number_fuel_correction_icao_annex_16(
         hydrogen_mass_content, thrust_setting
     )
+    d_nvpm_ein_pct_est = (1.0 - f_nvpm_ein_pct_est) * 100.0 * -1.0
     np.testing.assert_allclose(d_nvpm_ein_pct_est, d_nvpm_ein_pct, atol=0.01)
 
 
@@ -385,16 +485,38 @@ def test_stage_combustors_data_length(engine_uid: str):
     emissions = Emissions()
     edb_nvpm = emissions.edb_engine_nvpm[engine_uid]
 
+    # Construct emissions profile
+    nvpm_ei_m_t4_t2, nvpm_ei_n_t4_t2 = nvpm.nvpm_emission_profiles_t4_t2(
+        pressure_ratio=edb_nvpm.pressure_ratio,
+        hydrogen_content=13.8,
+        combustor=edb_nvpm.combustor,
+        temp_min=edb_nvpm.temp_min,
+        temp_max=edb_nvpm.temp_max,
+        q_fuel=edb_nvpm.fuel_heat * 1e6,
+        ff_7=edb_nvpm.ff_7,
+        ff_30=edb_nvpm.ff_30,
+        ff_85=edb_nvpm.ff_85,
+        ff_100=edb_nvpm.ff_100,
+        nvpm_ei_m_7=edb_nvpm.nvpm_ei_m_7,
+        nvpm_ei_m_30=edb_nvpm.nvpm_ei_m_30,
+        nvpm_ei_m_85=edb_nvpm.nvpm_ei_m_85,
+        nvpm_ei_m_100=edb_nvpm.nvpm_ei_m_100,
+        nvpm_ei_n_7=edb_nvpm.nvpm_ei_n_7,
+        nvpm_ei_n_30=edb_nvpm.nvpm_ei_n_30,
+        nvpm_ei_n_85=edb_nvpm.nvpm_ei_n_85,
+        nvpm_ei_n_100=edb_nvpm.nvpm_ei_n_100,
+    )
+
     # Multistage combuster engines have 5 datapoints in the interpolation set
-    assert len(edb_nvpm.nvpm_ei_m.fp) == 5
-    assert len(edb_nvpm.nvpm_ei_m.xp) == 5
-    assert len(edb_nvpm.nvpm_ei_n.fp) == 5
-    assert len(edb_nvpm.nvpm_ei_n.xp) == 5
+    assert len(nvpm_ei_m_t4_t2.fp) == 5
+    assert len(nvpm_ei_m_t4_t2.xp) == 5
+    assert len(nvpm_ei_n_t4_t2.fp) == 5
+    assert len(nvpm_ei_n_t4_t2.xp) == 5
 
     # But the final three y values are all equal
-    assert np.all(edb_nvpm.nvpm_ei_m.fp[2:] == edb_nvpm.nvpm_ei_m.fp[2])
-    assert np.all(edb_nvpm.nvpm_ei_n.fp[2:] == edb_nvpm.nvpm_ei_n.fp[2])
+    assert np.all(nvpm_ei_m_t4_t2.fp[2:] == nvpm_ei_m_t4_t2.fp[2])
+    assert np.all(nvpm_ei_n_t4_t2.fp[2:] == nvpm_ei_n_t4_t2.fp[2])
 
     # The final x values are increasing
-    assert np.all(np.diff(edb_nvpm.nvpm_ei_m.xp) > 0)
-    assert np.all(np.diff(edb_nvpm.nvpm_ei_n.xp) > 0)
+    assert np.all(np.diff(nvpm_ei_m_t4_t2.xp) > 0)
+    assert np.all(np.diff(nvpm_ei_n_t4_t2.xp) > 0)

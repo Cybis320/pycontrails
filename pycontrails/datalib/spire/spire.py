@@ -24,6 +24,7 @@ from pycontrails.datalib.spire.exceptions import (
     OriginAirportError,
     ROCDError,
     SchemaError,
+    UnknownAirportLocationError,
 )
 from pycontrails.physics import geo, units
 
@@ -79,7 +80,7 @@ class ValidateTrajectoryHandler:
     CRUISE_LOW_ALTITUDE_THRESHOLD_FT = 15000.0  # lowest expected cruise altitude
     INSTANTANEOUS_HIGH_GROUND_SPEED_THRESHOLD_MPS = 350.0  # 350m/sec ~= 780mph ~= 1260kph
     INSTANTANEOUS_LOW_GROUND_SPEED_THRESHOLD_MPS = 45.0  # 45m/sec ~= 100mph ~= 160kph
-    AVG_LOW_GROUND_SPEED_THRESHOLD_MPS = 100.0  # 120m/sec ~= 223mph ~= 360 kph
+    AVG_LOW_GROUND_SPEED_THRESHOLD_MPS = 85.0  # 85m/sec ~= 190mph ~= 306 kph
     AVG_LOW_GROUND_SPEED_ROLLING_WINDOW_PERIOD_MIN = 30.0  # rolling period for avg speed comparison
     AIRPORT_DISTANCE_THRESHOLD_KM = 200.0
     MIN_FLIGHT_LENGTH_HR = 0.4
@@ -98,7 +99,6 @@ class ValidateTrajectoryHandler:
         "departure_scheduled_time": pdtypes.is_datetime64_any_dtype,
         "arrival_airport_icao": pdtypes.is_string_dtype,
         "arrival_scheduled_time": pdtypes.is_datetime64_any_dtype,
-        "ingestion_time": pdtypes.is_datetime64_any_dtype,
         "timestamp": pdtypes.is_datetime64_any_dtype,
         "latitude": pdtypes.is_numeric_dtype,
         "longitude": pdtypes.is_numeric_dtype,
@@ -355,7 +355,7 @@ class ValidateTrajectoryHandler:
 
         return None
 
-    def _is_from_origin_airport(self) -> OriginAirportError | None:
+    def _is_from_origin_airport(self) -> OriginAirportError | UnknownAirportLocationError | None:
         """Verify the trajectory origin is a reasonable distance from the origin airport."""
         if self._df is None:
             msg = "No trajectory DataFrame has been set. Call set() before calling this method."
@@ -370,10 +370,16 @@ class ValidateTrajectoryHandler:
                 f"Distance {first_waypoint_dist_km:.3f}km is greater than "
                 f"threshold of {self.AIRPORT_DISTANCE_THRESHOLD_KM}km."
             )
-
+        if np.isnan(first_waypoint_dist_km):
+            return UnknownAirportLocationError(
+                f"Unable to identify distance between first waypoint in trajectory "
+                f"and the departure airport icao: {first_waypoint['departure_airport_icao']}"
+            )
         return None
 
-    def _is_to_destination_airport(self) -> DestinationAirportError | None:
+    def _is_to_destination_airport(
+        self,
+    ) -> DestinationAirportError | UnknownAirportLocationError | None:
         """Verify the trajectory destination is reasonable distance from the destination airport."""
         if self._df is None:
             msg = "No trajectory DataFrame has been set. Call set() before calling this method."
@@ -388,7 +394,11 @@ class ValidateTrajectoryHandler:
                 f"Distance {last_waypoint_dist_km:.3f}km is greater than "
                 f"threshold of {self.AIRPORT_DISTANCE_THRESHOLD_KM:.3f}km."
             )
-
+        if np.isnan(last_waypoint_dist_km):
+            return UnknownAirportLocationError(
+                f"Unable to identify distance between first waypoint in trajectory "
+                f"and the departure airport icao: {last_waypoint['arrival_airport_icao']}"
+            )
         return None
 
     def _is_too_slow(self) -> list[FlightTooSlowError]:

@@ -83,6 +83,17 @@ ARCO ERA5
     datalib.ecmwf.arco_era5
 
 
+DWD
+"""
+
+.. autosummary::
+    :toctree: api/
+
+    datalib.dwd.ICON
+    datalib.dwd.icon
+    datalib.dwd.ods
+
+
 Geostationary Satellites
 """"""""""""""""""""""""
 
@@ -105,6 +116,32 @@ Low Earth Orbit Satellites
     datalib.leo_utils
     datalib.leo_utils.landsat_metadata
     datalib.leo_utils.sentinel_metadata
+
+
+GRUAN Radiosondes
+"""""""""""""""""
+.. autosummary::
+    :toctree: api/
+
+    datalib.gruan.GRUAN
+
+
+Google Contrail Forecast
+""""""""""""""""""""""""
+.. autosummary::
+    :toctree: api/
+
+    datalib.google_forecast.GoogleForecast
+
+
+
+Aircraft Specifications
+"""""""""""""""""""""""
+
+.. autosummary::
+    :toctree: api/
+
+    datalib.ch_aviation
 
 
 Models
@@ -212,8 +249,8 @@ Emissions
     :toctree: api/
 
     models.emissions.Emissions
-    models.emissions.black_carbon
-    models.emissions.ffm2
+    models.emissions.nvpm
+    models.emissions.gaseous
 
 
 VPM Activation
@@ -276,6 +313,7 @@ Core
     core.coordinates
     core.fleet
     core.flight
+    core.flightplan
     core.fuel
     core.interpolation
     core.met
@@ -295,6 +333,7 @@ Utilities
     utils.iteration
     utils.temp
     utils.json
+    utils.array
     .. utils.synthetic_flight
 
 

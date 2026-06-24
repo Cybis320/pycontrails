@@ -447,7 +447,6 @@ def test_init_model(met: MetDataset, rad: MetDataset) -> None:
 
     # outputs
     assert cocip.contrail is None
-    assert cocip.contrail_dataset is None
 
 
 def test_cocip_processes_met(met: MetDataset, rad: MetDataset) -> None:
@@ -777,16 +776,17 @@ def test_flight_overrides_emissions(
     assert out4.attrs["wingspan"] == fl4.attrs["wingspan"]
 
 
-@pytest.mark.filterwarnings("ignore:distutils Version classes are deprecated")
 def test_flight_output(fl: Flight, met: MetDataset, rad: MetDataset) -> None:
     """Check `Cocip` outputs against data in static directory."""
     cocip = Cocip(
         met,
         rad=rad,
         process_emissions=False,
-        humidity_scaling=ExponentialBoostHumidityScaling(),
+        humidity_scaling=ConstantHumidityScaling(rhi_adj=0.8),  # crank up so we get some ef
     )
     out = cocip.eval(source=fl)
+    assert out["ef"].sum() > 0
+    assert out["cocip"].sum() > 0
 
     assert isinstance(out, Flight)
     assert out is not fl
@@ -796,37 +796,26 @@ def test_flight_output(fl: Flight, met: MetDataset, rad: MetDataset) -> None:
     assert np.all(out.level == out.level)
 
     assert "rf_net_mean" in cocip.source
-    assert "ef" in cocip.source
-    assert "cocip" in cocip.source
 
     assert out.attrs["flight_id"] == fl.attrs["flight_id"]
 
-    # make sure we can output flight dataframe
-    # this only works with fastparquet because `age` which is not handled by pyarrow correctly
-    out.dataframe.to_parquet(".test.pq", engine="fastparquet")
-    assert pathlib.Path(".test.pq").exists()
+    # Ensure we can save flight dataframe as parquet
+    try:
+        out.dataframe.to_parquet(".test.pq")
+        assert pathlib.Path(".test.pq").exists()
 
-    # note that fastparquet truncastes to [us],
-    # so when we read this back in the last 3 digits are off
-    # pyarrow doesn't support timedelta64 past "us", but pandas won't
-    # allow casting to "us" in a dataframe - bit of a mess
-    df = pd.read_parquet(".test.pq", engine="fastparquet")
-    np.testing.assert_allclose(df["contrail_age"].values, out.dataframe["contrail_age"].values)
+        df = pd.read_parquet(".test.pq")
 
-    # clean up
-    pathlib.Path(".test.pq").unlink()
+        # Compare as float nanoseconds (passing timedelta64 to assert_allclose
+        # trips a numpy 2.5 deprecation warning)
+        np.testing.assert_allclose(
+            df["contrail_age"] / np.timedelta64(1, "ns"),
+            out.dataframe["contrail_age"] / np.timedelta64(1, "ns"),
+        )
 
-    # make sure we can output flight dataframe using pyarrow with age in seconds
-    out.update(contrail_age=out["contrail_age"] / np.timedelta64(1, "s"))
-    out.update(time=out["time"].astype("datetime64[us]"))
-    out.dataframe.to_parquet(".test2.pq", engine="pyarrow")
-    assert pathlib.Path(".test2.pq").exists()
-
-    df = pd.read_parquet(".test2.pq", engine="pyarrow")
-    np.testing.assert_allclose(df["contrail_age"].values, out.dataframe["contrail_age"].values)
-
-    # clean up
-    pathlib.Path(".test2.pq").unlink()
+    finally:
+        # clean up
+        pathlib.Path(".test.pq").unlink()
 
 
 def test_eval_no_ef(cocip_no_ef: Cocip) -> None:
@@ -898,6 +887,16 @@ def test_eval_persistent(cocip_persistent: Cocip, regenerate_results: bool) -> N
     for key in flight_output:
         if key in ["time", "flight_id"]:
             np.testing.assert_array_equal(cocip_persistent.source[key], flight_output[key])
+            continue
+        if key == "contrail_age":
+            # Compare as float nanoseconds (passing timedelta64 to assert_allclose
+            # trips a numpy 2.5 deprecation warning)
+            np.testing.assert_allclose(
+                cocip_persistent.source[key] / np.timedelta64(1, "ns"),
+                flight_output[key] / np.timedelta64(1, "ns"),
+                err_msg=key,
+                rtol=rtol,
+            )
             continue
         if key == "atr20":
             np.testing.assert_allclose(
@@ -1055,19 +1054,10 @@ def test_eval_generic(reference: str, generic: str, request: pytest.FixtureReque
     )
 
 
-def test_xarray_contrail(cocip_persistent: Cocip) -> None:
-    """Confirm expected contrail output on attribute `contrail_dataset`."""
-    assert cocip_persistent.contrail_dataset["longitude"].shape == (8, 12)
-
-    # The contrail_dataset['timestep'] does not necessarily coincide with cocip.timesteps
-    assert cocip_persistent.contrail_dataset["timestep"].size == 8
-    assert cocip_persistent.contrail_dataset["waypoint"].size == 12
-
-
 def test_emissions(met: MetDataset, rad: MetDataset, bada_model: AircraftPerformance) -> None:
     """Test `Cocip` use of `Emissions` model."""
     # demo synthetic flight for BADA
-    attrs = {"flight_id": "test BADA/EDB", "aircraft_type": "A320", "load_factor": 0.7}
+    attrs = {"flight_id": "test BADA/EDB", "aircraft_type": "A320", "payload": 12000}
 
     # Example flight
     df = pd.DataFrame()
@@ -1630,11 +1620,14 @@ def test_cocip_no_persistence_ef_fill_value(fl: Flight, met: MetDataset, rad: Me
     np.testing.assert_array_equal(out["sac"], [0] * 8 + [np.nan] * 12)
     np.testing.assert_array_equal(out["ef"], [0] * 8 + [np.nan] * 12)
     np.testing.assert_array_equal(
-        out["contrail_age"], [np.timedelta64(0, "s")] * 8 + [np.timedelta64("nat")] * 12
+        out["contrail_age"], [np.timedelta64(0, "s")] * 8 + [np.timedelta64("nat", "ns")] * 12
     )
 
     # This key was removed
     assert "_met_intersection" not in out
+
+    assert isinstance(cocip.contrail, pd.DataFrame)
+    assert cocip.contrail.empty
 
 
 @pytest.mark.filterwarnings("ignore:.*the contrail has no intersection with the met")
@@ -1691,10 +1684,13 @@ def test_radiative_heating_effects_param(fl: Flight, met: MetDataset, rad: MetDa
     cocip = Cocip(met, rad=rad, params=params)
     fl1 = cocip.eval(source=fl)
     contrail1 = cocip.contrail
+    assert contrail1 is not None
     assert not cocip.params["radiative_heating_effects"]
+
     fl2 = cocip.eval(source=fl, radiative_heating_effects=True)
     assert cocip.params["radiative_heating_effects"]
     contrail2 = cocip.contrail
+    assert contrail2 is not None
 
     # Compare output between two model runs
     expected = {"d_heat_rate", "cumul_differential_heat", "heat_rate", "cumul_heat"}
@@ -1702,14 +1698,14 @@ def test_radiative_heating_effects_param(fl: Flight, met: MetDataset, rad: MetDa
 
     # Pretty massive difference in EF
     assert fl1["ef"].sum() == pytest.approx(7.3e12, rel=0.1)
-    assert fl2["ef"].sum() == pytest.approx(10.1e12, rel=0.1)
+    assert fl2["ef"].sum() == pytest.approx(4.1e12, rel=0.1)
 
     # Not nonzero in the same places!
     filt1 = fl1["ef"] != 0
     filt2 = fl2["ef"] != 0
     assert np.all(filt1 >= filt2)
     assert filt1.sum() == 10
-    assert filt2.sum() == 7
+    assert filt2.sum() == 8
 
 
 def test_radiative_heating_effects():
@@ -1941,8 +1937,8 @@ def test_cocip_vpm_activation(
     mean_ef = cocip.source["ef"].mean()
 
     if vpm_activation:
-        assert mean_n_ice_per_m_0 == pytest.approx(1764.93e11, rel=0.01)
-        assert mean_ef == pytest.approx(9.65e9, rel=0.01)
+        assert mean_n_ice_per_m_0 == pytest.approx(1074e11, rel=0.01)
+        assert mean_ef == pytest.approx(8.64e9, rel=0.01)
     else:
         assert mean_n_ice_per_m_0 == pytest.approx(8.87e11, rel=0.01)
         assert mean_ef == pytest.approx(4.90e9, rel=0.01)
@@ -2003,3 +1999,108 @@ def test_cocip_met_rad_variables_helper(
 ) -> None:
     """Test met and rad variable helper methods."""
     assert mvs == target
+
+
+@pytest.mark.filterwarnings(r"ignore:\n.*no humidity scaling")
+@pytest.mark.filterwarnings(r"ignore:.*no intersection with the met")
+@pytest.mark.parametrize(
+    ("T_add", "q_scale"),
+    [
+        (20, 1.0),  # SAC not satisfied at any waypoint
+        (10, 0.2),  # SAC satisfied at some waypoints, but no initially persistent contrails
+        (8, 0.2),  # some initially persistent contrails, but no surviving evolution at time 1
+        (0, 1.5),  # some surviving contrails at time 1
+    ],
+)
+def test_cocip_output_columns(
+    met: MetDataset,
+    rad: MetDataset,
+    fl: Flight,
+    T_add: float,
+    q_scale: float,
+) -> None:
+    """Confirm that the expected output columns are present in the CoCiP output."""
+    met.data["air_temperature"] += T_add
+    met.data["specific_humidity"] *= q_scale
+
+    cocip = Cocip(met=met, rad=rad, max_age="10 minutes", dt_integration="5 minutes")
+    out = cocip.eval(source=fl)
+
+    # Check that the number of columns is consistent
+    assert len(out.data) == 46
+    assert cocip.contrail is not None
+    assert len(cocip.contrail.columns) == 56
+
+    # In each test case, we make it slightly further into Cocip.eval
+    # The checks below confirm this
+    if (T_add, q_scale) == (20, 1.0):
+        assert out["sac"].sum() == 0.0
+        assert cocip.contrail.empty
+        return
+
+    if (T_add, q_scale) == (10, 0.2):
+        assert out["sac"].sum() == 14.0
+        assert out["persistent_1"].sum() == 0.0
+        assert cocip.contrail.empty
+        return
+
+    if (T_add, q_scale) == (8, 0.2):
+        assert out["sac"].sum() == 20
+        assert out["persistent_1"].sum() == 14
+        assert cocip.contrail.empty
+        assert out["ef"].sum() == 0.0
+        assert (out["cocip"] == 0.0).all()
+        return
+
+    if (T_add, q_scale) == (0, 1.5):
+        assert out["sac"].sum() == 20
+        assert out["persistent_1"].sum() == 19
+        assert len(cocip.contrail) == 36
+        assert out["ef"].sum() > 0.0
+        assert out["cocip"].sum() == 10
+        return
+
+    pytest.fail(f"Test case not implemented for T_add={T_add}, q_scale={q_scale}")
+
+
+def test_revised_contrail_ice_budget_param(fl: Flight, met: MetDataset, rad: MetDataset):
+    """Run Cocip with the revised_contrail_ice_budget parameter.
+
+    The purpose of this test is to show that this parameter changes simulation output.
+    """
+
+    fl.update(longitude=np.linspace(-29.0, -32.0, 20))
+    fl.update(latitude=np.linspace(56.0, 57.0, 20))
+    fl.update(altitude=np.full(20, 10900.0))
+
+    params = {
+        "max_age": np.timedelta64(90, "m"),  # keep short to avoid blowing out of bounds
+        "dt_integration": np.timedelta64(10, "m"),
+        "process_emissions": False,
+        "humidity_scaling": ExponentialBoostLatitudeCorrectionHumidityScaling(),
+    }
+
+    # Artificially shift time to get some SDR
+    met.data = met.data.assign_coords(time=met.data["time"] + np.timedelta64(12, "h"))
+    rad.data = rad.data.assign_coords(time=rad.data["time"] + np.timedelta64(12, "h"))
+    fl.update(time=fl["time"] + np.timedelta64(12, "h"))
+
+    cocip = Cocip(met, rad=rad, params=params)
+    fl1 = cocip.eval(source=fl)
+    contrail1 = cocip.contrail
+    assert contrail1 is not None
+    assert not cocip.params["revised_contrail_ice_budget"]
+
+    fl2 = cocip.eval(source=fl, revised_contrail_ice_budget=True)
+    assert cocip.params["revised_contrail_ice_budget"]
+    contrail2 = cocip.contrail
+    assert contrail2 is not None
+
+    # Compare output between two model runs
+    assert set(contrail1.columns) == set(contrail2.columns)
+
+    # Revisions generally increase EF, though only slightly when
+    # contrails are relatively young
+    assert fl1["ef"].sum() == pytest.approx(7.3e12, rel=0.1)
+    assert fl2["ef"].sum() == pytest.approx(7.3e12, rel=0.1)
+    assert fl2["ef"].sum() - fl1["ef"].sum() == pytest.approx(0.06e12, rel=0.1)

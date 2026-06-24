@@ -41,7 +41,6 @@ import numpy.typing as npt
 import pandas as pd
 import xarray as xr
 
-from pycontrails.core import interpolation
 from pycontrails.core import vector as vector_module
 from pycontrails.core.cache import CacheStore, DiskCacheStore
 from pycontrails.core.met_var import AirPressure, Altitude, MetVariable
@@ -54,6 +53,8 @@ logger = logging.getLogger(__name__)
 # optional imports
 if TYPE_CHECKING:
     import open3d as o3d
+
+    from pycontrails.core import interpolation
 
 XArrayType = TypeVar("XArrayType", xr.Dataset, xr.DataArray)
 MetDataType = TypeVar("MetDataType", "MetDataset", "MetDataArray")
@@ -682,7 +683,7 @@ class MetBase(ABC, Generic[XArrayType]):
         return type(self)._from_fastpath(self.data.copy(), cachestore=self.cachestore)
 
 
-class MetDataset(MetBase):
+class MetDataset(MetBase[xr.Dataset]):
     """Meteorological dataset with multiple variables.
 
     Composition around :class:`xarray.Dataset` to enforce certain
@@ -739,9 +740,9 @@ class MetDataset(MetBase):
 
     >>> # Check out a few values
     >>> da[5:8, 5:8, 1, 1].values
-    array([[224.08959005, 224.41374427, 224.75945349],
-           [224.09456429, 224.42037658, 224.76525676],
-           [224.10036756, 224.42617985, 224.77106004]])
+    array([[224.08936, 224.41357, 224.75928],
+           [224.09424, 224.42041, 224.76514],
+           [224.1001 , 224.42627, 224.771  ]], dtype=float32)
 
     >>> # Mean temperature over entire array
     >>> da.mean().load().item()
@@ -804,7 +805,7 @@ class MetDataset(MetBase):
             da = self.data[key]
         except KeyError as e:
             raise KeyError(
-                f"Variable {key} not found. Available variables: {', '.join(self.data.data_vars)}. "
+                f"Variable {key} not found. Available variables: {', '.join(self)}. "
                 "To get items (e.g. 'time' or 'level') from underlying xr.Dataset object, "
                 "use the 'data' attribute."
             ) from e
@@ -829,7 +830,7 @@ class MetDataset(MetBase):
 
     def __setitem__(
         self,
-        key: Hashable | list[Hashable] | Mapping,
+        key: Hashable | list[Hashable] | Mapping[Hashable, Any],
         value: Any,
     ) -> None:
         """Shortcut to set data variable on :attr:`data`.
@@ -838,7 +839,7 @@ class MetDataset(MetBase):
 
         Parameters
         ----------
-        key : Hashable | list[Hashable] | Mapping
+        key : Hashable | list[Hashable] | Mapping[Hashable, Any]
             Variable name
         value : Any
             Value to set to variable names
@@ -872,14 +873,14 @@ class MetDataset(MetBase):
 
         self.data.__setitem__(key, value)
 
-    def update(self, other: MutableMapping | None = None, **kwargs: Any) -> None:
+    def update(self, other: MutableMapping[Hashable, Any] | None = None, **kwargs: Any) -> None:
         """Shortcut to :meth:`data.update`.
 
         See :meth:`xarray.Dataset.update` for reference.
 
         Parameters
         ----------
-        other : MutableMapping
+        other : MutableMapping[Hashable, Any]
             Variables with which to update this dataset
         **kwargs : Any
             Variables defined by keyword arguments. If a variable exists both in
@@ -1145,11 +1146,11 @@ class MetDataset(MetBase):
         Returns
         -------
         str
-            Provider of the data. If not one of ``"ECMWF"`` or ``"NCEP"``,
+            Provider of the data. If not one of ``"ECMWF"``, ``"NCEP"``, or ``"DWD"``,
             a warning is issued.
         """
-        supported = ("ECMWF", "NCEP")
-        examples = {"ECMWF": "data provided by ECMWF", "NCEP": "GFS data"}
+        supported = ("ECMWF", "NCEP", "DWD")
+        examples = {"ECMWF": "data provided by ECMWF", "NCEP": "GFS data", "DWD": "ICON data"}
         return self._get_pycontrails_attr_template("provider", supported, examples)
 
     @property
@@ -1160,13 +1161,14 @@ class MetDataset(MetBase):
         -------
         str
             Dataset of the data. If not one of ``"ERA5"``, ``"HRES"``, ``"IFS"``,
-            or ``"GFS"``, a warning is issued.
+            ``"GFS"``, ``"ICON"``, ``"ICON-EU"``, or ``"ICON-D2"``, a warning is issued.
         """
-        supported = ("ERA5", "HRES", "IFS", "GFS")
+        supported = ("ERA5", "HRES", "IFS", "GFS", "ICON", "ICON-EU", "ICON-D2")
         examples = {
             "ERA5": "ECMWF ERA5 reanalysis data",
             "HRES": "ECMWF HRES forecast data",
             "GFS": "NCEP GFS forecast data",
+            "ICON": "DWD ICON forecast data",
         }
         return self._get_pycontrails_attr_template("dataset", supported, examples)
 
@@ -1241,6 +1243,7 @@ class MetDataset(MetBase):
         latitude: npt.ArrayLike | float,
         level: npt.ArrayLike | float,
         time: npt.ArrayLike | np.datetime64,
+        **kwargs: Any,
     ) -> Self:
         r"""Create a :class:`MetDataset` containing a coordinate skeleton from coordinate arrays.
 
@@ -1252,6 +1255,8 @@ class MetDataset(MetBase):
             Vertical coordinate, in [:math:`hPa`]
         time: npt.ArrayLike | np.datetime64,
             Temporal coordinates, in [:math:`UTC`]. Will be sorted.
+        **kwargs : Any
+            Passed into the constructor of the returned :class:`MetDataset`.
 
         Returns
         -------
@@ -1274,9 +1279,9 @@ class MetDataset(MetBase):
           * longitude     (longitude) float64 160B 0.0 0.5 1.0 1.5 ... 8.0 8.5 9.0 9.5
           * latitude      (latitude) float64 160B 0.0 0.5 1.0 1.5 ... 8.0 8.5 9.0 9.5
           * level         (level) float64 16B 250.0 300.0
-          * time          (time) datetime64[ns] 8B 2019-01-01
             air_pressure  (level) float32 8B 2.5e+04 3e+04
             altitude      (level) float32 8B 1.036e+04 9.164e+03
+          * time          (time) datetime64[ns] 8B 2019-01-01
         Data variables:
             *empty*
 
@@ -1297,9 +1302,9 @@ class MetDataset(MetBase):
           * longitude     (longitude) float64 160B 0.0 0.5 1.0 1.5 ... 8.0 8.5 9.0 9.5
           * latitude      (latitude) float64 160B 0.0 0.5 1.0 1.5 ... 8.0 8.5 9.0 9.5
           * level         (level) float64 16B 250.0 300.0
-          * time          (time) datetime64[ns] 8B 2019-01-01
             air_pressure  (level) float32 8B 2.5e+04 3e+04
             altitude      (level) float32 8B 1.036e+04 9.164e+03
+          * time          (time) datetime64[ns] 8B 2019-01-01
         Data variables:
             temperature   (longitude, latitude, level, time) float64 6kB 234.5 ... 234.5
             humidity      (longitude, latitude, level, time) float64 6kB 0.5 0.5 ... 0.5
@@ -1338,7 +1343,7 @@ class MetDataset(MetBase):
 
             coords[key] = arr
 
-        return cls(xr.Dataset({}, coords=coords))
+        return cls(xr.Dataset({}, coords=coords), **kwargs)
 
     @classmethod
     def from_zarr(cls, store: Any, **kwargs: Any) -> Self:
@@ -1361,7 +1366,7 @@ class MetDataset(MetBase):
         return cls(ds)
 
 
-class MetDataArray(MetBase):
+class MetDataArray(MetBase[xr.DataArray]):
     """Meteorological DataArray of single variable.
 
     Wrapper around :class:`xarray.DataArray` to enforce certain
@@ -1658,15 +1663,15 @@ class MetDataArray(MetBase):
 
         >>> # Interpolation at a grid point agrees with value
         >>> mda.interpolate(1, 2, 300, np.datetime64('2022-03-01T14:00'))
-        array([241.91972984])
+        array([241.91965], dtype=float32)
 
         >>> da = mda.data
         >>> da.sel(longitude=1, latitude=2, level=300, time=np.datetime64('2022-03-01T14')).item()
-        241.9197298421629
+        241.91964721679688
 
         >>> # Interpolation off grid
         >>> mda.interpolate(1.1, 2.1, 290, np.datetime64('2022-03-01 13:10'))
-        array([239.83793798])
+        array([239.83798], dtype=float32)
 
         >>> # Interpolate along path
         >>> longitude = np.linspace(1, 2, 10)
@@ -1674,16 +1679,17 @@ class MetDataArray(MetBase):
         >>> level = np.linspace(200, 300, 10)
         >>> time = pd.date_range("2022-03-01T14", periods=10, freq="5min")
         >>> mda.interpolate(longitude, latitude, level, time)
-        array([220.44347694, 223.08900738, 225.74338924, 228.41642088,
-               231.10858599, 233.54857391, 235.71504913, 237.86478872,
-               239.99274623, 242.10792167])
+        array([220.44347, 223.08897, 225.74326, 228.41641, 231.1086 , 233.54855,
+               235.715  , 237.86479, 239.9927 , 242.10797], dtype=float32)
 
         >>> # Can easily switch to alternative low-memory implementation
         >>> mda.interpolate(longitude, latitude, level, time, lowmem=True)
-        array([220.44347694, 223.08900738, 225.74338924, 228.41642088,
-               231.10858599, 233.54857391, 235.71504913, 237.86478872,
-               239.99274623, 242.10792167])
+        array([220.44347, 223.08897, 225.74326, 228.41641, 231.1086 , 233.54855,
+               235.715  , 237.86479, 239.9927 , 242.10797], dtype=float32)
+
         """
+        from pycontrails.core import interpolation
+
         if lowmem:
             return self._interp_lowmem(
                 longitude,
@@ -1740,6 +1746,8 @@ class MetDataArray(MetBase):
         Parameters and return types are identical to :meth:`interpolate`, except
         that the ``localize`` keyword argument is omitted.
         """
+        from pycontrails.core import interpolation
+
         # Convert all inputs to 1d arrays
         # Not validating against ndim >= 2
         longitude, latitude, level, time = np.atleast_1d(longitude, latitude, level, time)
@@ -2199,7 +2207,7 @@ class MetDataArray(MetBase):
         altitude_scale: float = ...,
         output_vertex_normals: bool = ...,
         closed: bool = ...,
-    ) -> dict: ...
+    ) -> dict[str, Any]: ...
 
     @overload
     def to_polyhedra(
@@ -2228,7 +2236,7 @@ class MetDataArray(MetBase):
         altitude_scale: float = 1.0,
         output_vertex_normals: bool = False,
         closed: bool = True,
-    ) -> dict | o3d.geometry.TriangleMesh:
+    ) -> dict[str, Any] | o3d.geometry.TriangleMesh:
         """Create a collection of polyhedra from spatial array corresponding to a single time slice.
 
         Parameters
@@ -2783,11 +2791,11 @@ def _add_vertical_coords(data: XArrayType) -> XArrayType:
     # It is more important for air_pressure and altitude to be grid-aligned than to be
     # coordinate-aligned, so we use the dtype of the data to determine the precision of
     # these coordinates
-    dtype = (
-        np.result_type(*data.data_vars.values(), np.float32)
-        if isinstance(data, xr.Dataset)
-        else data.dtype
-    )
+    if isinstance(data, xr.Dataset):
+        dtypes = [v.dtype for v in data.data_vars.values() if np.issubdtype(v.dtype, np.floating)]
+        dtype = np.result_type(*dtypes, np.float32)
+    else:
+        dtype = data.dtype
 
     level = data["level"].values
 

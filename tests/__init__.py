@@ -5,9 +5,9 @@ import pathlib
 import platform
 
 import requests
-from google.cloud import storage
 
 import pycontrails
+from pycontrails.datalib import ch_aviation
 
 # Overwrite any CDS env configuration
 os.environ["CDSAPI_URL"] = "FAKE"
@@ -19,8 +19,10 @@ default_bada_root = pathlib.Path(*pycontrails.__path__).parents[1] / "bada"
 BADA_ROOT = pathlib.Path(os.getenv("BADA_CACHE_DIR", default_bada_root))
 BADA3_PATH = BADA_ROOT / "bada3"
 BADA4_PATH = BADA_ROOT / "bada4"
-
 BADA_AVAILABLE = BADA3_PATH.exists() and BADA4_PATH.exists()
+
+CH_AVIATION_AVAILABLE = ch_aviation._ch_aviation_root_path().is_dir()
+
 IS_WINDOWS = platform.system() == "Windows"
 
 # Disable the extended_k15 experimental warning in tests
@@ -37,6 +39,8 @@ else:
     OPEN3D_AVAILABLE = True
 
 try:
+    from google.cloud import storage
+
     storage.Client()
 except Exception:
     GCP_CREDENTIALS = False
@@ -52,9 +56,15 @@ except Exception:
 else:
     BIGQUERY_ACCESS = True
 
-try:
-    requests.get("https://github.com", timeout=5)
-except Exception:
+# Tests that make network calls are skipped when OFFLINE is True. Set the
+# PYCONTRAILS_OFFLINE environment variable to force these tests to be skipped
+# regardless of network availability (e.g., in the release workflow).
+if os.getenv("PYCONTRAILS_OFFLINE"):
     OFFLINE = True
 else:
-    OFFLINE = False
+    try:
+        requests.get("https://github.com", timeout=5)
+    except Exception:
+        OFFLINE = True
+    else:
+        OFFLINE = False

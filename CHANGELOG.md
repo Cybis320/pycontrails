@@ -1,5 +1,246 @@
 # Changelog
 
+## 0.63.3
+
+### Fixes
+
+- Fix release workflow that prevented v0.63.2 wheels from being uploaded to PyPI.
+
+### Breaking changes
+
+- No longer build wheels for macOS x86_64. (macOS arm64 wheels will continue to be built and supported.)
+
+### Internals
+
+- Move cibuildwheel configs from the `.github/workflows/release.yaml` workflow to the `pyproject.toml` for easier local testing.
+- Remove mypy check for python 3.11 in the test workflow (numpy 2.5 only supports python 3.12 and above).
+- Remove the `pytest.mark.unreliable` marker in favor of skipping tests that make network calls with `pytest.mark.skipif(OFFLINE)`. Set the `PYCONTRAILS_OFFLINE` environment variable to force these tests to be skipped regardless of network availability. This variable is now set in the release workflow to skip all tests that make network calls.
+- Remove the `IN_GITHUB_ACTIONS` flag from the LEO tests, which was redundant with the `PYCONTRAILS_SKIP_LEO_TESTS` environment variable.
+
+## 0.63.2
+
+### Fixes
+
+- Fix unit conversion bug identified in `nvpm_ei_m` estimates when SCOPE11 is used. This does not affect the downstream simulated contrail properties and forcing estimates.
+
+### Internals
+
+- Refactor emissions functions so that SI units are used throughout computations. This ensures consistency and prevents future unit conversion bugs.
+
+## 0.63.1
+
+### Breaking changes
+
+- Fix an ICON datalib bug so that `"u"` and `"v"` are correctly mapped to zonal and meridional wind, respectively. Users of the ICON datalib should update to the latest pycontrails version to avoid incorrectly transposing horizontal wind components.
+
+### Fixes
+
+- Fix a `Cocip` radiative heating bug introduced in v0.61.0 in which the minimum `w_prime` value was accidentally squared, before being squared again when calculating `d_v`. While the effect of this bug was significant, it only occurred when the `radiative_heating_effects` parameter was enabled (disabled by default).
+- Ensure `met_utils.ml_to_pl` handles cases where dataset dimension order is different from variable dimension order.
+- Pass user-provided `turbulent_vertical_velocity_scale` parameter through to vortex downwash calculations in `Cocip` and `CocipGrid`.
+
+## 0.63.0
+
+### Features
+
+- Support extrapolation in model-level-to-pressure-level interpolation (`pycontrails.datalib.ecmwf.ml_to_pl`).
+
+### Fixes
+
+- Fix `jet.cargo_load_factor` to handle cases where no data is available for the specified origin and destination region pair. In such cases, the function now falls back to using global mean estimates instead of raising a meaningless error.
+- No longer set `Flight.attrs` with NaN or NaT values in `ChAviation` datalib when the metadata is missing.
+
+### Internals
+
+- Add minor performance improvements to Poll-Schumann internal model functions.
+- Update Spire `ValidateTrajectoryHandler.AVG_LOW_GROUND_SPEED_THRESHOLD_MPS` constant from 100 m/s to 85 m/s based on 2024-2025 flights data analysis.
+- Handle timezone-aware timestamps in met datalibs.
+
+### Breaking changes
+
+- Remove `ingestion_time` from Spire data schema as it's not required for any contrail predictions.
+- Expose the maximum Mach number buffer applied in `PSFlight` via a new `AircraftPerformanceParams.max_mach_buffer` parameter. Previously this was hard-coded to 0.02. The default value has now changed from 0.02 to 0.0. With this new default, downstream users should expect a small change in `PSFlight` fuel flow estimates (typically a decrease) when working with noisy ADS-B. Set this to 0.02 to retain previous behavior.
+- Change the `fl.attrs["aircraft_performance_model"]` value from `"PSFlight"` to `"PS"` when the `PSFlight` model is used for consistency with `BADAFlight`.
+- Rename the function arguments `max_takeoff_weight` -> `amass_mtow` and `operating_empty_weight` -> `amass_oew` in `jet.update_aircraft_mass` and `jet.initial_aircraft_mass`. This is to standardize the naming convention for aircraft mass parameters across pycontrails. Typically these functions are not called directly so the risk that downstream code is affected by this change is low.
+
+## 0.62.0
+
+### Features
+
+- Experimental: Implement a revised version of the CoCiP contrail ice budget, disabled by default and activated in `Cocip` and `CocipGrid` by setting the `revised_contrail_ice_budget` parameter to `True`. The revisions and their impact on CoCiP simulations will be described in detail in a future publication; in brief, the revised ice budget includes tendencies associated with sedimentation across an ambient humidity gradient and ensures that contrails conserve total ice when in air at 100% RHi. This feature should be used with caution, as it changes the optical properties of aged contrails and leads to significant increases in contrail radiative forcing.
+
+### Internals
+
+- Update `CocipParams.particles_{lean,rich}_burn` ambient particle GSD from 2.3 to 2.2 for consistency with Teoh et al. (2026, in preparation).
+
+## 0.61.0
+
+### Features
+
+- Experimental: Integrate alternative contrail parametric radiative forcing model (Schumann, 2025) into the CoCiP workflow: The original parametric RF model assumes a near-linear dependence of contrail RF on the contrail and natural cirrus optical depth and provides the best fit to the libRadtran dataset with the minimum number of model coefficients. This alternative model provides a stronger non-linear dependence to the contrail and natural cirrus optical depth, consistent with the ECMWF ecRad model, but yields a slightly weaker fit to the libRadtran dataset. This new parameterization can be enabled within the `Cocip` and `CocipGrid` models via the `parametric_rf_model_s2025` parameter.
+- Add new `GeoVectorDataset.intersect_met_cross_section` method which can be used create curtain plots of meteorological variables along a flight track. See the [Google Forecast notebook](https://py.contrails.org/integrations/GoogleForecast.html) for an example of this method in use.
+- Make the turbulent vertical velocity scale used to calculate vertical diffusivity (`w_N'` in Equation 35 of [Schumann 2012](https://doi.org/10.5194/gmd-5-543-2012)) a user-configurable parameter.
+
+### Breaking changes
+
+- Replace the previous methodology for estimating aircraft mass (based on load factor) with a new approach that estimates payload mass based on passenger seat count aircraft and cargo capacity. Evaluated against the Brazilian ANAC dataset, this refinement improves takeoff mass accuracy by 5 - 10%. Aircraft performance models (`PSFlight` and `BADAFlight`) have been updated to integrate this new approach.
+- Integrate the [Dray et al. (2024) cargo load factor database](https://doi.org/10.1016/j.jairtraman.2024.102692), which provides the 2019 annual mean origin-destination specific cargo load factors in the passenger hold and dedicated freighters. Discontinue the use of the IATA cargo load factor database, as it does not distinguish between freight carried in the passenger hold and dedicated freighters.
+- Provide reference values for the number of seats for each passenger aircraft type to improve payload estimates.
+- Remove `DEFAULT_LOAD_FACTOR` and `jet.aircraft_load_factor`. Passenger aircraft and cargo aircraft load factors are now handled separately.
+- Fix a bug in the vertical diffusivity calculation. Vertical diffusivity is now correctly diagnosed based on the square of the turbulent vertical velocity scale. This changes default behavior only when the turbulent vertical velocity scale is itself diagnosed based on differential radiative heating at the top and bottom of the contrail (`radiative_heating_effects = True`).
+
+## 0.60.5
+
+### Breaking changes
+
+- Update the extended K15 model to better align with the pyrcel model as described in [Ponsonby et al. (2025)](https://acp.copernicus.org/articles/25/18617/2025/). This update changes the root-finding logic in cases of multiple roots for determining the critical droplet activation number required to quench plume supersaturation. Numerical simulations suggest that this update is unlikely to affect global contrail simulations.
+- Update assumed vPM properties and workflow used in the extended K15 model to align with the revised methodology (Teoh et al., 2026, in preparation).
+  - Add new `particles_rich_burn` and `particles_lean_burn` fields to `CocipParams`. These fields are only used within the `Cocip` runtime if the `vpm_activation` parameter is enabled.
+  - When `vpm_activation` is enabled, waypoints are split into "rich burn" and "lean burn" categories based on the `nvpm_ei_n` value at each waypoint. Currently a hard-coded threshold of `1e12` is used to determine the fuel burn category of each waypoint.
+- Refactor the Poll-Schumann engine deterioration logic to apply deterioration at runtime rather than during aircraft-engine parameter loading. This may change behavior for downstream code that relied on pre-scaled engine parameters or called low-level Poll-Schumann functions without explicitly passing an engine deterioration factor, but should not affect the runtime behavior of the `PSFlight` model.
+- Apply the `engine_deterioration_factor` parameter in `PSFlight` via `eta -> eta / (1 + engine_deterioration_factor)` instead of `eta -> eta * (1 - engine_deterioration_factor)`. The new formulation is consistent with interpreting the factor as a fractional increase in fuel consumption. The two are equivalent to first order.
+
+### Features
+
+- Add new `ChAviation` datalib to query the ch-aviation fleet database for aircraft metadata. Requires ch-aviation data access.
+- Add age-based engine deterioration estimation to `PSFlight` using the `aircraft_age_yrs` field, with separate deterioration curves for narrow-body and wide-body aircraft. The applied engine deterioration factor is now determined using the following order of precedence:
+  1. An explicitly provided `engine_deterioration_factor` on the `source`.
+  2. An estimation based on the `aircraft_age_yrs` field.
+  3. The default `PSFlight` parameter value.
+- Add OFP XML flight plan parser following ARINC 633. This allows parsing standardized flight plans into `Flight` instances.
+
+### Fixes
+
+- The `final_waypoints` instance attribute is now correctly updated by `Fleet.filter` when filtering removes the final waypoint of a flight.
+
+### Internals
+
+- The `SyntheticFlight` class now sets airspeed using the `speed_m_per_s` parameter whenever it is provided. This parameter was previously used only as a fallback when BADA files were not available.
+- Download tar-gzipped BADA files from GCS in the test workflow instead of individual files to speed up download time and reduce the likelihood of the CI failing due to transient gcloud bugs.
+- Add new `aircraft_spec` module which defines known narrow-body and wide-body aircraft types.
+
+## 0.60.4
+
+### Features
+
+- Add new `UnknownAirportLocationError` to the `ValidationHandler` of the Spire datalib module. This error is used in the airport distance validation check. Previously, if an airport location was unknown, the airport distance check would succeed. Now, the airport distance check will return this new error.
+
+### Fixes
+
+- Fix a bug in the experimental `Cocip` radiative heating model that caused cumulative heating to be double-counted under certain conditions. This issue only occurred when the `radiative_heating_effect` parameter was enabled (disabled by default).
+- Fix regression in the `Cocip` ice survival calculation that only affected cases where the `"unterstrasser_ice_survival_fraction"` parameter is enabled (this parameter is disabled by default).
+
+### Internals
+
+- Support OAuth and `google-auth` default authentication for the `GoogleForecast` datalib.
+- Extend the IATA passenger and cargo load factor database to include new data from January-2025 to January-2026. This update introduces small changes to the load factor estimates for certain routes.
+
+## 0.60.3
+
+### Breaking changes
+
+- Update nvPM fuel correction for the GAIA workflow: The standard ICAO Annex 16 methodology is now used in place of the Teoh et al. (2022) approach.
+- Revise fallback for engines not covered in the nvPM ICAO EDB: The SCOPE11 method now replaces the FOX-ImFOX methodology in the GAIA workflow. SCOPE11 is used to construct the nvPM emissions profile, which is then passed to the T4/T2 methodology to estimate the cruise nvPM mass and number emissions.
+- The `Cocip.contrail` attribute is now always set to a `pd.DataFrame` after `eval` is called, even when no contrails are formed. Previously, it remained `None` in early-exit scenarios. The empty DataFrame has standardized column names and dtypes matching the structure produced when contrails persist.
+- The `Cocip` model now adds consistent output columns to `source` regardless of whether contrails are formed. When no contrails form, columns such as `sdr_mean`, `rsr_mean`, `olr_mean`, `rf_sw_mean`, `rf_lw_mean`, `rf_net_mean`, and intermediate SAC/downwash columns (`width`, `depth`, `rhi_1`, `rho_air_1`, `iwc_1`, `f_surv`, etc.) are filled with `nan` values. This ensures that the output schema is consistent across runs of `Cocip.eval` but may slightly increase memory usage in scenarios where no contrails are formed.
+- Remove the `Cocip.contrail_dataset` attribute. Previously this was computed when `Cocip.eval` was run with the `verbose_outputs` flag enabled. If needed, users can recompute recompute this via `xr.Dataset.from_dataframe(cocip.contrail.set_index(["timestep", "waypoint"]))`.
+
+### Features
+
+- Add `GoogleForecast` datalib for accessing [Google Contrail forecasts](https://developers.google.com/contrails/v1/forecast-description). See the [Google Forecast notebook](https://py.contrails.org/notebooks/GoogleForecast.html) for usage.
+
+### Fixes
+
+- Constant nvPM EI cases are now correctly adjusted for the fuel hydrogen content.
+- Address breaking changes to `pandas.Timestamp` unit resolution introduced in [pandas 3.0](https://pandas.pydata.org/docs/whatsnew/v3.0.0.html#datetime-timedelta-resolution-inference).
+
+### Internals
+
+- Run test suite on python 3.14 in CI.
+- Add additional [pandas 3.0](https://pandas.pydata.org/docs/dev/whatsnew/v3.0.0.html) compatibility when `Flight` arrays are read-only.
+- Add new unit test to improve ease of evaluating different nvPM models.
+- Fill missing temperature and pressure values in the EDB gaseous CSV file with ISA standard atmosphere values. This only affects older engines for which these values are missing.
+- Assume a constant nvPM emission index when smoke numbers are not available.
+
+## 0.60.2
+
+### Features
+
+- Improve memory and compute performance of the extended K15 model by constructing intermediate lookup tables for the activation radius calculation. The new implementation uses a cached `RegularGridInterpolator` to approximate the activation radius instead of repeated root-finding, providing significant speedups when running the vPM activation model over large datasets (such as in `CocipGrid` or `Cocip` with a large `Fleet`).
+- Add new `CocipParams.max_horizontal_diffusivity` and `CocipParams.max_vertical_diffusivity` parameters to cap the maximum diffusivity used within `Cocip` to simulate contrail spreading. Both parameters are optional and default to `None`, in which case no cap is applied. See Section 2.2 of [Schumann and Seifert (2025)](https://doi.org/10.5194/acp-25-18571-2025) for details.
+- Allow passing `max_depth=None` as a valid `CocipParams` parameter to disable the maximum contrail depth limit in `Cocip`. In a future release, the diffusivity-based depth limit will be the default behavior.
+
+### Fixes
+
+- Update `PycontrailsRegularGridInterpolator` for compatibility with changes introduced in [scipy 1.17](https://docs.scipy.org/doc/scipy/release/1.17.0-notes.html#scipy-interpolate-improvements).
+
+### Internals
+
+- Change the default `n_plume_points` parameter in `droplet_apparent_emission_index` from 50 to 40.
+- The experimental warning in the extended K15 model can now be suppressed by setting the `PYCONTRAILS_SILENCE_VPM_WARNING` environment variable.
+- Add a `Particle.vpm_ei` field to represent the volatile particulate matter (vPM) emission index number. Remove the `vpm_ei_n` parameter in various functions within the `extended_k15` module in favor of this new field.
+
+## 0.60.1
+
+### Fixes
+
+- Fix `numpy.shape` incompatibility in the MEEM2 emissions model for DAC, TAPS, or TAPS II combustors. The MEEM2 implementation for these combustors is not yet finalized.
+- Fix resampling bug for flights with long gaps between waypoints that contain an antimeridian crossing.
+
+### Internals
+
+- Add [pandas 3.0](https://pandas.pydata.org/docs/dev/whatsnew/v3.0.0.html) compatibility.
+
+## 0.60.0
+
+### Features
+
+- Add a datalib to support ICON forecast access via the [DWD Open Data Server](https://opendata.dwd.de/). See the [ICON notebook](https://py.contrails.org/notebooks/ICON.html) for usage examples.
+
+### Internals
+
+- Add `"DWD"` as a recognized meteorology provider and `"ICON"`, `"ICON-EU"`, and `"ICON-D2"` as recognized meteorology datasets in `met.py`.
+- Add geometric vertical velocity as a new generic `MetVariable`.
+- Modify `metsource.parse_timesteps` to accept a new optional `shift` argument. This argument can be used to make `metsource.parse_timesteps` return times that are not even multiples of `freq` (e.g., six-hourly timesteps starting at 3Z). The behavior of `metsource.parse_timesteps` is unchanged if this argument is omitted.
+- Extract some utilities for ECMWF model-to-pressure-level conversion to a more flexible (less ECMWF-specific) `met_utils.ml_to_pl` function and a new `utils.arrays` module. The updated utilities include some minor behavioral changes to improve handling of nan values.
+- Add utilities for running coroutines sychronously.
+- Register `pytest.mark.unreliable` to mark unreliable tests (e.g., tests vulnerable to upstream changes in an external service). These tests are skipped in the release workflow.
+- Skip tempfile removal in `temp.py` utility module when the temporary file does not exist.
+
+## 0.59.1
+
+### Features
+
+- Update the [ICAO EDB](https://www.easa.europa.eu/en/domains/environment/icao-aircraft-engine-emissions-databank) static files used in pycontrails emissions modeling from v29b to v31. With this update, pycontrails now supports emissions modeling for 858 engines (up from 595 engines in v29b).
+- Add [MEEM2](https://doi.org/10.4271/2025-01-6000) and [SCOPE11](https://doi.org/10.1021/acs.est.8b04060) as alternative models to simulate nvPM emissions.
+
+### Fixes
+
+- Correct conditional logic in `thermo._e_sat_piecewise` to prevent `thermo.q_sat` from returning `np.nan` for temperatures below freezing (0°C).
+- Update doctests for compatibility with `float32` ERA5 variables.
+
+### Internals
+
+- Open the backdoor to running `Cocip` with a fuel-varying `Fleet`. This is not officially supported and requires some undocumented monkey-patching.
+- Specify `join="outer"` and `compat="no_conflicts"` when opening multiple netCDF files in `metsource.open_mfdataset` to avoid xarray `FutureWarning`.
+- Update cached doctest data in `gs://contrails-301217-unit-test/doc-test-cache` with current output from the `ERA5` datalib. This data now contains `float32` rather than `float64` variables. Old doctest data is archived in `gs://contrails-301217-unit-test/doc-test-cache-v0.59.0`.
+- Include additional fields in the ICAO EDB static files. For example, MEEM2 utilizes a fifth data point (maximum nvPM EI) to construct the nvPM emissions profile.
+- Major re-structuring and clean-up of the emissions module to improve intuitiveness and standardize terminology.
+
+## 0.59.0
+
+### Features
+
+- Add lightweight `GRUAN` datalib for accessing GRUAN radiosonde data via FTP. See the [GRUAN notebook](https://py.contrails.org/notebooks/GRUAN.html) for usage examples.
+
+### Breaking changes
+
+- Updated error handling in `goes.gcs_goes_path` to raise a `FileNotFoundError` if any of the requested bands are not available. Previous versions raised a `RuntimeError` only in cases where no requested bands were available.
+
+### Fixes
+
+- Ensure call to `np.clip` in `contrail_properties.initial_ice_particle_number` is backwards compatible with numpy < 2.1.
+
 ## 0.58.0
 
 ### Features
@@ -203,7 +444,7 @@
   - Converting between `Fleet` and `Flight` instances via `Fleet.from_seq` and `Fleet.to_flight_list` are also ~5x faster.
 - Implement low-memory met-downselection logic in `DryAdvection`. This is the same logic used in `CocipGrid` to reduce memory consumption by only loading the necessary time slices of the `met` data into memory. If `met` is already loaded into memory, this change will have no effect.
 
-### Breaking Changes
+### Breaking changes
 
 - Remove the `copy` parameter from `GeovectorDataset.downselect_met`. This method always returns a view of the original dataset.
 - Remove the `validate` parameter in  the `MetDataArray` constructor. Input data is now always validated.

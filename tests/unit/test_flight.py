@@ -17,6 +17,7 @@ from pycontrails import Flight, GeoVectorDataset, MetDataArray, MetDataset, SAFB
 from pycontrails.core import flight
 from pycontrails.models.issr import ISSR
 from pycontrails.physics import constants, jet, units
+from pycontrails.utils.json import NumpyEncoder
 
 ##########
 # Fixtures
@@ -434,7 +435,7 @@ def test_altitude_interpolation(fl: Flight) -> None:
 
     def _check_rocd(_fl: Flight, nominal_rocd: float = constants.nominal_rocd) -> np.bool_:
         """Check rate of climb/descent."""
-        dt = np.diff(_fl["time"], append=np.datetime64("NaT")) / np.timedelta64(1, "s")
+        dt = np.diff(_fl["time"], append=np.datetime64("NaT", "ns")) / np.timedelta64(1, "s")
         dalt = np.diff(_fl.altitude, append=np.nan)
         rocd = np.abs(dalt / dt)
         return np.all(rocd[:-1] < 2 * nominal_rocd)
@@ -977,6 +978,37 @@ def test_no_viable_antimeridian_shift(direction: str) -> None:
         fl.resample_and_fill("5s")
 
 
+@pytest.mark.parametrize("direction", ["east", "west"])
+@pytest.mark.parametrize("missing_quadrant", ["east", "west"])
+def test_quadrant_plus_antimeridian_cross(direction: str, missing_quadrant: str) -> None:
+    """Test resampling for flights that cross entire longitudinal quadrant plus antimeridian."""
+    n = 100
+    if direction == "east":
+        longitude = np.linspace(10, 10 + 340, n)
+    else:
+        longitude = np.linspace(350, 350 - 340, n)
+    longitude = (longitude + 180) % 360 - 180
+    fl = Flight(
+        longitude=longitude,
+        latitude=np.zeros(n),
+        altitude=np.full(n, 10000),
+        time=pd.date_range("2022-01-01", "2022-01-01T06", n),
+    )
+
+    if missing_quadrant == "east":
+        mask = (longitude >= -180) & (longitude <= -90)
+    else:
+        mask = (longitude <= 180) & (longitude >= 90)
+    fl = fl.filter(~mask)
+
+    fl2 = fl.resample_and_fill("5s")
+    assert np.all(fl2["longitude"] < 180)
+    assert np.all(fl2["longitude"] >= -180)
+    assert np.all(np.isfinite(fl2["longitude"]))
+    assert np.all(fl2.segment_length()[:-1] < 10000)
+    assert np.all(fl2.segment_length()[:-1] > 8000)
+
+
 def test_intersect_issr_met(met_era5_fake: MetDataset, flight_fake: Flight) -> None:
     """Test `intersect_met` and `length_met` methods."""
     issr = ISSR(met_era5_fake).eval()["issr"]
@@ -1177,7 +1209,7 @@ def test_flight_to_dict(flight_fake: Flight) -> None:
     assert "level" not in flight_dict
 
     # Ensure serializable
-    assert json.dumps(flight_dict)
+    assert json.dumps(flight_dict, cls=NumpyEncoder)
 
     # Ensure time is in unix seconds
     assert flight_dict["time"][0] < 1e10
@@ -1377,49 +1409,148 @@ def test_rocd_hydrostatic_equation() -> None:
     )
 
 
-class TestLoadFactorEstimates:
+class TestPassengerLoadFactorEstimates:
     def test_normal_times(self) -> None:
         origin_airport_icao = "WSSS"
         first_waypoint_time = pd.to_datetime("2024-06-01 09:21:48")
-        lf = jet.aircraft_load_factor(origin_airport_icao, first_waypoint_time)
+        lf = jet.passenger_load_factor(origin_airport_icao, first_waypoint_time)
         assert lf == pytest.approx(0.824, abs=1e-3)
 
     def test_date_out_of_bounds_future(self) -> None:
         origin_airport_icao = "WSSS"
         first_waypoint_time = pd.to_datetime("2035-06-01 09:21:48")
-        lf = jet.aircraft_load_factor(origin_airport_icao, first_waypoint_time)
-        assert lf == pytest.approx(0.824, abs=1e-3)
+        lf = jet.passenger_load_factor(origin_airport_icao, first_waypoint_time)
+        assert lf == pytest.approx(0.833, abs=1e-3)
 
     def test_date_out_of_bounds_past(self) -> None:
         origin_airport_icao = "WSSS"
         first_waypoint_time = pd.to_datetime("2016-06-15 17:39:27")
-        lf = jet.aircraft_load_factor(origin_airport_icao, first_waypoint_time)
+        lf = jet.passenger_load_factor(origin_airport_icao, first_waypoint_time)
         assert lf == pytest.approx(0.821, abs=1e-3)
 
     def test_no_date(self) -> None:
         origin_airport_icao = "WSSS"
-        lf = jet.aircraft_load_factor(origin_airport_icao, None)
-        assert lf == pytest.approx(0.833, abs=1e-3)
+        lf = jet.passenger_load_factor(origin_airport_icao, None)
+        assert lf == pytest.approx(0.842, abs=1e-3)
 
     def test_no_airport(self) -> None:
         first_waypoint_time = pd.to_datetime("2016-06-15 17:39:27")
-        lf = jet.aircraft_load_factor(None, first_waypoint_time)
+        lf = jet.passenger_load_factor(None, first_waypoint_time)
         assert lf == pytest.approx(0.844, abs=1e-3)
 
     def test_erroneous_airport(self) -> None:
         first_waypoint_time = pd.to_datetime("2016-06-15 17:39:27")
         origin_airport_icao = "!REF"
-        lf = jet.aircraft_load_factor(origin_airport_icao, first_waypoint_time)
+        lf = jet.passenger_load_factor(origin_airport_icao, first_waypoint_time)
         assert lf == pytest.approx(0.844, abs=1e-3)
 
     def test_covid_period(self) -> None:
         origin_airport_icao = "KJFK"
         first_waypoint_time = pd.to_datetime("2020-03-24 00:30:24")
-        lf = jet.aircraft_load_factor(origin_airport_icao, first_waypoint_time)
+        lf = jet.passenger_load_factor(origin_airport_icao, first_waypoint_time)
         assert lf == pytest.approx(0.439, abs=1e-3)
 
     def test_freighter(self) -> None:
         origin_airport_icao = "KJFK"
         first_waypoint_time = pd.to_datetime("2020-03-24 00:30:24")
-        lf = jet.aircraft_load_factor(origin_airport_icao, first_waypoint_time, freighter=True)
-        assert lf == pytest.approx(0.446, abs=1e-3)
+        lf = jet.passenger_load_factor(origin_airport_icao, first_waypoint_time)
+        assert lf == pytest.approx(0.439, abs=1e-3)
+
+
+class TestCargoLoadFactorEstimates:
+    def test_europe_to_usa_on_pax_ac(self) -> None:
+        origin_airport_icao = "EGLL"
+        destination_airport_icao = "KJFK"
+        total_flight_dist = 5539.9
+        pax_ac = True
+        lf = jet.cargo_load_factor(
+            origin_airport_icao, destination_airport_icao, total_flight_dist, pax_ac
+        )
+        assert lf == pytest.approx(0.407, abs=1e-3)
+
+    def test_usa_to_europe_on_pax_ac(self) -> None:
+        # Asymmetry freight flow between Europe and USA
+        origin_airport_icao = "KJFK"
+        destination_airport_icao = "EGLL"
+        total_flight_dist = 5539.9
+        pax_ac = True
+        lf = jet.cargo_load_factor(
+            origin_airport_icao, destination_airport_icao, total_flight_dist, pax_ac
+        )
+        assert lf == pytest.approx(0.191, abs=1e-3)
+
+    def test_usa_to_europe_on_cargo_ac(self) -> None:
+        # Higher cargo load factors on dedicated freighters
+        origin_airport_icao = "KJFK"
+        destination_airport_icao = "EGLL"
+        total_flight_dist = 5539.9
+        pax_ac = False
+        lf = jet.cargo_load_factor(
+            origin_airport_icao, destination_airport_icao, total_flight_dist, pax_ac
+        )
+        assert lf == pytest.approx(0.640, abs=1e-3)
+
+    def test_usa_to_europe_on_cargo_ac_no_dist(self) -> None:
+        # Distance not provided
+        origin_airport_icao = "KJFK"
+        destination_airport_icao = "EGLL"
+        total_flight_dist = None
+        pax_ac = False
+        lf = jet.cargo_load_factor(
+            origin_airport_icao, destination_airport_icao, total_flight_dist, pax_ac
+        )
+        assert lf == pytest.approx(0.640, abs=1e-3)
+
+    def test_cargo_ac_no_origin_no_dist(self) -> None:
+        # Output should be the 2019 annual mean values for dedicated freighters
+        origin_airport_icao = " "
+        destination_airport_icao = "EGLL"
+        total_flight_dist = None
+        pax_ac = False
+        lf = jet.cargo_load_factor(
+            origin_airport_icao, destination_airport_icao, total_flight_dist, pax_ac
+        )
+        assert lf == pytest.approx(0.553, abs=1e-3)
+
+    def test_pax_ac_no_origin_no_dist(self) -> None:
+        # Output should be the 2019 annual mean values for passenger aircraft
+        origin_airport_icao = " "
+        destination_airport_icao = "EGLL"
+        total_flight_dist = None
+        pax_ac = True
+        lf = jet.cargo_load_factor(
+            origin_airport_icao, destination_airport_icao, total_flight_dist, pax_ac
+        )
+        assert lf == pytest.approx(0.171, abs=1e-3)
+
+    def test_pax_ac_short_haul_no_airports(self) -> None:
+        origin_airport_icao = None
+        destination_airport_icao = None
+        total_flight_dist = 1300.0
+        pax_ac = True
+        lf = jet.cargo_load_factor(
+            origin_airport_icao, destination_airport_icao, total_flight_dist, pax_ac
+        )
+        assert lf == pytest.approx(0.089, abs=1e-3)
+
+    def test_pax_ac_long_haul_no_airports(self) -> None:
+        # Test against Dray et al. (2024) reference values
+        origin_airport_icao = None
+        destination_airport_icao = None
+        total_flight_dist = 6500.0
+        pax_ac = True
+        lf = jet.cargo_load_factor(
+            origin_airport_icao, destination_airport_icao, total_flight_dist, pax_ac
+        )
+        assert lf == pytest.approx(0.394, abs=1e-3)
+
+    def test_cargo_ac_long_haul_no_airports(self) -> None:
+        # Test against Dray et al. (2024) reference values
+        origin_airport_icao = None
+        destination_airport_icao = None
+        total_flight_dist = 6500.0
+        pax_ac = False
+        lf = jet.cargo_load_factor(
+            origin_airport_icao, destination_airport_icao, total_flight_dist, pax_ac
+        )
+        assert lf == pytest.approx(0.664, abs=1e-3)
