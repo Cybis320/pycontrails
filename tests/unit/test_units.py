@@ -139,6 +139,7 @@ def test_mach_tas(rng: np.random.Generator):
             "m_to_longitude_distance",
             "tas_to_mach_number",
             "mach_number_to_tas",
+            "geopotential_to_geometric_height",
             "dt_to_seconds",
         ]
         and not name.startswith("_")
@@ -175,3 +176,94 @@ def test_handle_nan(func):
     np.testing.assert_array_equal(np.isfinite(y), [True, True, False, True])
     assert np.isnan(x[2])
     assert np.isnan(y[2])
+
+
+def test_normal_gravity_reference_values():
+    """Check WGS-84 Somigliana normal gravity against known reference values."""
+    assert units.normal_gravity(0.0) == pytest.approx(9.78033, abs=1e-4)
+    assert units.normal_gravity(45.0) == pytest.approx(9.80620, abs=1e-4)
+    assert units.normal_gravity(52.0) == pytest.approx(9.81247, abs=1e-4)
+    assert units.normal_gravity(90.0) == pytest.approx(9.83218, abs=1e-4)
+
+    # Gravity increases monotonically from the equator to the pole.
+    g = units.normal_gravity(np.array([0.0, 45.0, 52.0, 90.0]))
+    assert np.all(np.diff(g) > 0.0)
+
+    # Symmetric about the equator.
+    np.testing.assert_allclose(
+        units.normal_gravity(np.array([-45.0, -10.0, 30.0])),
+        units.normal_gravity(np.array([45.0, 10.0, -30.0])),
+    )
+
+
+def test_geopotential_to_geometric_height_reference():
+    """Check geopotential to geometric height conversion across latitudes.
+
+    The input geopotential corresponds to a WMO geopotential height of 11000 m
+    (``Phi = 11000 * constants.g``). The latitude-correct geometric height is
+    larger than 11000 m near the equator and smaller near the pole.
+    """
+    geopotential = 11000.0 * constants.g
+
+    z_equator = units.geopotential_to_geometric_height(geopotential, 0.0)
+    z_mid = units.geopotential_to_geometric_height(geopotential, 45.0)
+    z_pole = units.geopotential_to_geometric_height(geopotential, 90.0)
+
+    assert z_equator == pytest.approx(11048.8, abs=0.5)
+    assert z_mid == pytest.approx(11019.1, abs=0.5)
+    assert z_pole == pytest.approx(10990.0, abs=0.5)
+
+    # The latitude-systematic correction spans ~59 m from equator to pole, with the
+    # equator height under-stated and the pole height over-stated by the legacy
+    # fixed-``g0`` diagnostic.
+    assert z_equator - z_pole == pytest.approx(59.0, abs=1.0)
+    assert z_equator > z_mid > z_pole
+
+
+def test_geopotential_to_geometric_height_crossover():
+    """Near 45 deg latitude the result matches the legacy fixed-``g0`` height.
+
+    45 deg is the crossover latitude where the WGS-84 normal gravity is closest to
+    the WMO constant ``constants.g``, so the latitude-correct geometric height
+    agrees with the legacy ``Phi / g0`` curvature formula to within ~0.5 m (versus a
+    ~30 m deviation at the equator and pole).
+    """
+    geopotential = 11000.0 * constants.g
+
+    # Legacy geometric height: divide by the fixed WMO g0 and apply the curvature
+    # correction with a fixed effective radius.
+    h_legacy = geopotential / constants.g  # == 11000 m
+    r_fixed = 6356766.0
+    legacy = h_legacy + h_legacy**2 / (r_fixed - h_legacy)
+
+    result = units.geopotential_to_geometric_height(geopotential, 45.0)
+    assert result == pytest.approx(legacy, abs=1.0)
+
+    # The deviation at the equator is far larger, confirming 45 deg is the crossover.
+    equator = units.geopotential_to_geometric_height(geopotential, 0.0)
+    assert abs(equator - legacy) > 25.0
+
+
+def test_geopotential_to_geometric_height_broadcast_dataarray():
+    """Latitude broadcasts against a geopotential field while preserving type."""
+    geopotential = 11000.0 * constants.g
+    latitudes = np.array([0.0, 45.0, 90.0])
+
+    # 2D geopotential field (e.g. the ERA5 ``z`` field) and a latitude coordinate.
+    z = xr.DataArray(
+        np.full((3, 4), geopotential),
+        dims=("latitude", "longitude"),
+        coords={"latitude": latitudes, "longitude": np.arange(4.0)},
+    )
+
+    out = units.geopotential_to_geometric_height(z, z["latitude"])
+
+    # Type is preserved: a DataArray is not silently downcast to a bare ndarray.
+    assert isinstance(out, xr.DataArray)
+    assert out.shape == z.shape
+    assert set(out.dims) == set(z.dims)
+
+    # Each latitude row agrees with the scalar computation at that latitude.
+    for i, lat in enumerate(latitudes):
+        expected = units.geopotential_to_geometric_height(geopotential, float(lat))
+        np.testing.assert_allclose(out.isel(latitude=i).to_numpy(), expected)

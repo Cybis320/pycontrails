@@ -240,6 +240,133 @@ def radians_to_degrees(radians: ArrayScalarLike) -> ArrayScalarLike:
     return radians * (180.0 / np.pi)
 
 
+@support_arraylike
+def normal_gravity(latitude: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+    r"""Calculate WGS-84 normal (sea-level) gravity at a given latitude.
+
+    Uses the closed-form Somigliana expression for normal gravity on the surface
+    of the WGS-84 reference ellipsoid
+
+    .. math::
+
+        g(\phi) = g_e \frac{1 + k \sin^2\phi}{\sqrt{1 - e^2 \sin^2\phi}}
+
+    This is the *true* latitude-varying acceleration of gravity. It differs from
+    the fixed WMO standard value :attr:`constants.g` (:math:`9.80665 \ m \ s^{-2}`,
+    the approximate value at :math:`45 \deg` latitude) used elsewhere in this
+    module for pressure-altitude conversions.
+
+    Parameters
+    ----------
+    latitude : npt.NDArray[np.floating]
+        Geodetic latitude, [:math:`\deg`]
+
+    Returns
+    -------
+    npt.NDArray[np.floating]
+        Normal gravity at mean sea level, [:math:`m \ s^{-2}`]
+
+    Notes
+    -----
+    Coefficients are the WGS-84 defining constants: equatorial normal gravity
+    :math:`g_e = 9.7803253359 \ m \ s^{-2}`, the Somigliana constant
+    :math:`k = 0.00193185265241`, and the squared first eccentricity
+    :math:`e^2 = 0.00669437999014`. See
+    https://en.wikipedia.org/wiki/Theoretical_gravity#Somigliana_equation.
+
+    See Also
+    --------
+    geopotential_to_geometric_height
+    """
+    # WGS-84 Somigliana normal gravity coefficients
+    g_e = 9.7803253359  # equatorial normal gravity, [m s-2]
+    k = 0.00193185265241  # Somigliana formula constant
+    e2 = 0.00669437999014  # square of the first eccentricity of the ellipsoid
+
+    sin2 = np.sin(degrees_to_radians(latitude)) ** 2
+    return g_e * (1.0 + k * sin2) / np.sqrt(1.0 - e2 * sin2)
+
+
+def _effective_earth_radius(latitude: ArrayScalarLike, gravity: ArrayScalarLike) -> ArrayScalarLike:
+    r"""Calculate the latitude-dependent effective Earth radius.
+
+    List (1968) / Mahoney effective radius used to convert a geopotential height
+    into a geometric height by accounting for the curvature of the Earth
+
+    .. math::
+
+        R(\phi) = \frac{2 \, g(\phi)}
+        {3.085462 \times 10^{-6} + 2.27 \times 10^{-9} \cos 2\phi
+        - 2.0 \times 10^{-12} \cos 4\phi}
+
+    Parameters
+    ----------
+    latitude : ArrayScalarLike
+        Geodetic latitude, [:math:`\deg`]
+    gravity : ArrayScalarLike
+        WGS-84 normal gravity :math:`g(\phi)` at ``latitude`` (from
+        :func:`normal_gravity`). Passed in by the caller so it is not recomputed.
+
+    Returns
+    -------
+    ArrayScalarLike
+        Effective Earth radius, [:math:`m`]. ``R(45) ~ 6.356e6``.
+    """
+    lat_rad = degrees_to_radians(latitude)
+    denominator = 3.085462e-6 + 2.27e-9 * np.cos(2.0 * lat_rad) - 2.0e-12 * np.cos(4.0 * lat_rad)
+    return 2.0 * gravity / denominator
+
+
+def geopotential_to_geometric_height(
+    geopotential: ArrayScalarLike, latitude: ArrayScalarLike
+) -> ArrayScalarLike:
+    r"""Convert geopotential to geometric height above the geoid.
+
+    The ERA5 ``z`` field is a geopotential :math:`\Phi` (:math:`m^2 \ s^{-2}`),
+    i.e. :math:`\int g \, \mathrm{d}z` with the true latitude-varying gravity
+    already integrated by the model. The standard WMO geopotential-height
+    diagnostic recovers a height as :math:`\Phi / g_0` using the fixed constant
+    :math:`g_0 = 9.80665 \ m \ s^{-2}` (:attr:`constants.g`). That is a correct
+    geopotential-height diagnostic but **not** a true geometric altitude: a single
+    :math:`45 \deg` gravity value mis-scales the height by :math:`g_0 / g(\phi)`,
+    a latitude-systematic error that flips sign about :math:`45 \deg` (about
+    :math:`+30 \ m` at the equator, :math:`0` near :math:`45 \deg`, and
+    :math:`-29 \ m` at the pole at :math:`11 \ km`).
+
+    This converter therefore intentionally divides by the latitude-dependent
+    normal gravity :func:`normal_gravity` rather than by the fixed
+    :attr:`constants.g`, then applies a curvature correction using the effective
+    Earth radius :func:`_effective_earth_radius`
+
+    .. math::
+
+        H = \frac{\Phi}{g(\phi)}, \qquad
+        z_{\mathrm{geom}} = H \frac{R(\phi)}{R(\phi) - H}
+
+    Parameters
+    ----------
+    geopotential : ArrayScalarLike
+        Geopotential :math:`\Phi` (the ERA5 ``z`` field), [:math:`m^2 \ s^{-2}`]
+    latitude : ArrayScalarLike
+        Geodetic latitude, broadcast against ``geopotential``, [:math:`\deg`]
+
+    Returns
+    -------
+    ArrayScalarLike
+        Geometric height above the geoid (orthometric / MSL height), [:math:`m`].
+        No geoid undulation is added and no conversion to WGS-84 ellipsoidal
+        height is performed; the caller owns the geoid datum.
+
+    See Also
+    --------
+    normal_gravity
+    """
+    gravity = normal_gravity(latitude)
+    geopotential_height = geopotential / gravity
+    r_eff = _effective_earth_radius(latitude, gravity)
+    return geopotential_height * r_eff / (r_eff - geopotential_height)
+
+
 def ft_to_m(ft: ArrayScalarLike) -> ArrayScalarLike:
     """Convert length from feet to meter.
 
