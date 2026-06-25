@@ -18,6 +18,12 @@ g: float = 9.80665
 #: Radius of Earth :math:`[m]`
 radius_earth: float = 6371229.0
 
+#: WGS-84 ellipsoid semi-major axis :math:`[m]`
+WGS84_a: float = 6378137.0
+
+#: WGS-84 ellipsoid first eccentricity squared
+WGS84_e2: float = 0.00669437999014
+
 #: Surface area of Earth :math:`[m^2]`
 surface_area_earth: float = 5.10072e14
 

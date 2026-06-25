@@ -30,7 +30,7 @@ from pycontrails.core.met_var import (
 )
 from pycontrails.core.vector import GeoVectorDataset
 from pycontrails.models.cocip import contrail_properties, wind_shear
-from pycontrails.physics import geo, thermo
+from pycontrails.physics import geo, thermo, units
 
 
 @dataclasses.dataclass
@@ -252,9 +252,11 @@ class DryAdvection(models.Model):
                 continue
             evolved.append(vector1)  # NOTE: vector1 is mutated below (geometry and weather added)
 
+            # Downselect through the step's target time ``t`` (not just the current
+            # waypoint times): RK4 re-interpolates the wind at the step midpoint and
+            # endpoint, so met must cover [t0, t].
             t0 = vector1["time"].min()
-            t1 = vector1["time"].max()
-            met = maybe_downselect_mds(self.met, met, t0, t1)
+            met = maybe_downselect_mds(self.met, met, t0, t)
 
             # Calculate downwash parameters if enabled
             downwash_params = None
@@ -604,6 +606,126 @@ def _calc_geometry(
     return azimuth_2, width_2, depth_2, sigma_yz_2, area_eff_2
 
 
+def _advect_centerline_rk4(
+    met: MetDataset,
+    vector: GeoVectorDataset,
+    t: np.datetime64,
+    *,
+    extra_dp_dt: npt.NDArray[np.floating] | float,
+    **interp_kwargs: Any,
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+    r"""Integrate the plume centerline over one step with classical RK4.
+
+    The centerline obeys the ordinary differential equation
+
+    .. math::
+
+        \frac{d\lambda}{dt} = \frac{u}{(N(\phi) + z) \cos\phi}, \quad
+        \frac{d\phi}{dt} = \frac{v}{M(\phi) + z}, \quad
+        \frac{dp}{dt} = \frac{\omega + \text{extra}}{100}
+
+    where :math:`(u, v, \omega)` are re-interpolated from ``met`` at each of the four
+    RK4 stages (start, two midpoints, end) and the intermediate positions. This
+    replaces the previous forward-Euler step, which froze the wind at the start of
+    the step and accrued kilometre-scale error over 1-3 h in curving flow.
+    ``extra_dp_dt`` is the per-step-constant pressure tendency from sedimentation
+    (and optional downwash), [:math:`Pa \ s^{-1}`].
+
+    Coordinates accumulate in ``float64`` to avoid a random-walk error over the many
+    steps of a multi-hour integration.
+
+    Parameters
+    ----------
+    met : MetDataset
+        Meteorology providing ``eastward_wind``, ``northward_wind`` and
+        ``lagrangian_tendency_of_air_pressure``.
+    vector : GeoVectorDataset
+        Waypoints at the start of the step. Start-of-step winds (``u_wind``,
+        ``v_wind``, ``vertical_velocity``) are reused for the first RK4 stage.
+    t : np.datetime64
+        Target time at the end of the step.
+    extra_dp_dt : npt.NDArray[np.floating] | float
+        Constant pressure tendency added to the interpolated vertical velocity at
+        every stage, [:math:`Pa \ s^{-1}`].
+    **interp_kwargs : Any
+        Interpolation keyword arguments forwarded to :meth:`intersect_met`.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray, np.ndarray]
+        New longitude, latitude and pressure level, [:math:`\deg`, :math:`\deg`,
+        :math:`hPa`].
+    """
+    # ``q_method`` only applies to specific-humidity interpolation; drop it so the
+    # wind/omega kwargs are accepted by ``intersect_met`` (a fresh local dict).
+    interp_kwargs.pop("q_method", None)
+
+    # float64 accumulation (a float32 coordinate random-walks over hundreds of steps)
+    lon0 = vector["longitude"].astype(np.float64)
+    lat0 = vector["latitude"].astype(np.float64)
+    lev0 = np.asarray(vector.level, dtype=np.float64)
+    time0 = vector["time"]
+
+    dt_td = t - time0
+    dt_s = units.dt_to_seconds(dt_td)
+    t_half = time0 + dt_td / 2
+    t_full = np.full(lon0.shape, t)
+
+    deg_per_rad = 180.0 / np.pi
+
+    u_mda = met["eastward_wind"]
+    v_mda = met["northward_wind"]
+    w_mda = met["lagrangian_tendency_of_air_pressure"]
+
+    def rates(
+        lon: np.ndarray,
+        lat: np.ndarray,
+        lev: np.ndarray,
+        u: np.ndarray,
+        v: np.ndarray,
+        w: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        altitude = units.pl_to_m(lev)
+        r_ew = geo.prime_vertical_radius_of_curvature(lat, altitude)
+        r_ns = geo.meridional_radius_of_curvature(lat, altitude)
+        cos_lat = np.cos(units.degrees_to_radians(lat))
+        dlon = deg_per_rad * u / (r_ew * cos_lat)
+        dlat = deg_per_rad * v / r_ns
+        dlev = (w + extra_dp_dt) / 100.0
+        return dlon, dlat, dlev
+
+    def interp(
+        lon: np.ndarray, lat: np.ndarray, lev: np.ndarray, time: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        kw = {"longitude": lon, "latitude": lat, "level": lev, "time": time, **interp_kwargs}
+        return (
+            vector.intersect_met(u_mda, **kw),
+            vector.intersect_met(v_mda, **kw),
+            vector.intersect_met(w_mda, **kw),
+        )
+
+    # Stage 1 reuses the once-per-step interpolation already attached to ``vector``.
+    k1 = rates(lon0, lat0, lev0, vector["u_wind"], vector["v_wind"], vector["vertical_velocity"])
+
+    half = dt_s / 2.0
+    lon_a, lat_a, lev_a = lon0 + half * k1[0], lat0 + half * k1[1], lev0 + half * k1[2]
+    k2 = rates(lon_a, lat_a, lev_a, *interp(lon_a, lat_a, lev_a, t_half))
+
+    lon_b, lat_b, lev_b = lon0 + half * k2[0], lat0 + half * k2[1], lev0 + half * k2[2]
+    k3 = rates(lon_b, lat_b, lev_b, *interp(lon_b, lat_b, lev_b, t_half))
+
+    lon_c, lat_c, lev_c = lon0 + dt_s * k3[0], lat0 + dt_s * k3[1], lev0 + dt_s * k3[2]
+    k4 = rates(lon_c, lat_c, lev_c, *interp(lon_c, lat_c, lev_c, t_full))
+
+    sixth = dt_s / 6.0
+    lon2 = lon0 + sixth * (k1[0] + 2.0 * k2[0] + 2.0 * k3[0] + k4[0])
+    lat2 = lat0 + sixth * (k1[1] + 2.0 * k2[1] + 2.0 * k3[1] + k4[1])
+    lev2 = lev0 + sixth * (k1[2] + 2.0 * k2[2] + 2.0 * k3[2] + k4[2])
+
+    lon2 = (lon2 + 180.0) % 360.0 - 180.0  # wrap antimeridian
+    return lon2, lat2, lev2
+
+
 def _evolve_one_step(
     met: MetDataset,
     vector: GeoVectorDataset,
@@ -623,9 +745,10 @@ def _evolve_one_step(
 
     downwash_enabled = downwash_params is not None
     _perform_interp_for_step(met, vector, dz_m, downwash_enabled=downwash_enabled, **interp_kwargs)
-    u_wind = vector["u_wind"]
-    v_wind = vector["v_wind"]
-    vertical_velocity = vector["vertical_velocity"] + sedimentation_rate
+
+    # Per-step-constant pressure tendency (Pa/s) added to the interpolated vertical
+    # velocity at every RK4 stage: sedimentation plus optional downwash.
+    extra_dp_dt: npt.NDArray[np.floating] | float = sedimentation_rate
 
     # Apply downwash as additional vertical velocity if enabled
     if downwash_params is not None:
@@ -665,19 +788,13 @@ def _evolve_one_step(
         # Negative velocity (descent) gives positive pressure rate
         downwash_pressure_rate = dp_dz * (-downwash_velocity)
 
-        vertical_velocity = vertical_velocity + downwash_pressure_rate
-
-    latitude = vector["latitude"]
-    longitude = vector["longitude"]
+        extra_dp_dt = extra_dp_dt + downwash_pressure_rate
 
     dt = t - vector["time"]
-    longitude_2, latitude_2 = geo.advect_horizontal(longitude, latitude, u_wind, v_wind, dt)
-    level_2 = geo.advect_level(
-        vector.level,
-        vertical_velocity,
-        rho_air=0.0,
-        terminal_fall_speed=0.0,
-        dt=dt,
+    # Integrate the centerline with classical RK4 (re-interpolating the wind at each
+    # stage) rather than freezing the start-of-step wind (forward Euler).
+    longitude_2, latitude_2, level_2 = _advect_centerline_rk4(
+        met, vector, t, extra_dp_dt=extra_dp_dt, **interp_kwargs
     )
 
     out = GeoVectorDataset._from_fastpath(

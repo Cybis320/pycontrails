@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pyproj
 import pytest
+import xarray as xr
 
 from pycontrails import Flight, GeoVectorDataset, MetDataset
 from pycontrails.models.cocip import Cocip
 from pycontrails.models.dry_advection import DryAdvection
 from pycontrails.models.humidity_scaling import ConstantHumidityScaling
+from pycontrails.physics import geo
 
 
 @pytest.fixture()
@@ -38,7 +41,7 @@ def test_dry_advection(
     model = DryAdvection(met_cocip1, params)
     out = model.eval(source)
     assert isinstance(out, GeoVectorDataset)
-    assert len(out) == 3532
+    assert len(out) == 3524
 
     assert out["age"].max() == np.timedelta64(1, "h")
 
@@ -50,7 +53,7 @@ def test_dry_advection(
     # Pin some values to ensure that the model is working as expected
     abs = 0.1
     if azimuth in (0.0, 180.0):
-        assert np.nanmean(out["width"]) == pytest.approx(1018.5, abs=abs)
+        assert np.nanmean(out["width"]) == pytest.approx(1019.6, abs=abs)
     elif azimuth in (90.0, 270.0):
         assert np.nanmean(out["width"]) == pytest.approx(763.9, abs=abs)
     else:
@@ -130,9 +133,9 @@ def test_dry_advection_verbose_outputs(
         assert n_variables == 16
 
     if include_source_in_output:
-        assert n_rows == 3532 + len(source)
+        assert n_rows == 3524 + len(source)
     else:
-        assert n_rows == 3532
+        assert n_rows == 3524
 
 
 @pytest.mark.parametrize("include_source_in_output", [True, False])
@@ -163,11 +166,11 @@ def test_dry_advection_flight_id_in_output(
     assert "flight_id" in source
     assert "flight_id" in out
     if include_source_in_output:
-        assert (out["flight_id"] == "flight1").sum() == 2059 + len(source1)
-        assert (out["flight_id"] == "flight2").sum() == 1473 + len(source2)
+        assert (out["flight_id"] == "flight1").sum() == 2054 + len(source1)
+        assert (out["flight_id"] == "flight2").sum() == 1470 + len(source2)
     else:
-        assert (out["flight_id"] == "flight1").sum() == 2059
-        assert (out["flight_id"] == "flight2").sum() == 1473
+        assert (out["flight_id"] == "flight1").sum() == 2054
+        assert (out["flight_id"] == "flight2").sum() == 1470
 
 
 def test_dry_advection_gap_in_waypoints(met_cocip1: MetDataset) -> None:
@@ -218,7 +221,7 @@ def test_dry_advection_with_timesteps(
     out = model.eval(flight_cocip1)
 
     assert isinstance(out, GeoVectorDataset)
-    assert len(out) == 159
+    assert len(out) == 158
     # the very first waypoint blows out of bounds, so it's not in the output
     np.testing.assert_array_equal(np.unique(out["time"]), timesteps[1:])
 
@@ -228,3 +231,87 @@ def test_dry_advection_with_timesteps(
     assert isinstance(out, GeoVectorDataset)
     assert len(out) == 35
     assert out["age"].max() <= np.timedelta64(10, "m")
+
+
+def test_dry_advection_rk4_solid_body_rotation() -> None:
+    """RK4 centerline stays accurate in curving flow (acceptance test for Fix 1).
+
+    A solid-body rotation wind field (tangential speed 50 m/s at radius 100 km)
+    continuously curves the wind, so forward Euler accrues large truncation error.
+    Classical RK4 at a 5 min step must track the rotation to within 3 m at 3 h,
+    measured against a converged 30 s reference integration of the same ODE. The
+    ellipsoidal geometry cancels in this comparison, isolating integrator error.
+    """
+    speed = 50.0  # m/s
+    radius = 100_000.0  # m
+    omega = speed / radius  # rad/s
+    lon0, lat0 = 0.0, 45.0
+
+    # Local metres-per-degree at the rotation centre (WGS-84).
+    m_per_deg_lon = (
+        np.deg2rad(1.0)
+        * float(geo.prime_vertical_radius_of_curvature(lat0))
+        * np.cos(np.deg2rad(lat0))
+    )
+    m_per_deg_lat = np.deg2rad(1.0) * float(geo.meridional_radius_of_curvature(lat0))
+
+    # Grid covering the orbit (~0.9 deg radius) with margin. The wind is linear in
+    # position, so linear interpolation is exact at any resolution.
+    longitude = np.arange(lon0 - 2.0, lon0 + 2.01, 0.25)
+    latitude = np.arange(lat0 - 2.0, lat0 + 2.01, 0.25)
+    level = np.array([250.0])
+    time = np.array(["2022-01-01T00:00:00", "2022-01-01T06:00:00"], dtype="datetime64[ns]")
+
+    met = MetDataset.from_coords(longitude=longitude, latitude=latitude, level=level, time=time)
+    lon_g, lat_g = np.meshgrid(
+        met.data["longitude"].values, met.data["latitude"].values, indexing="ij"
+    )
+    dx = (lon_g - lon0) * m_per_deg_lon
+    dy = (lat_g - lat0) * m_per_deg_lat
+    u = -omega * dy  # solid-body rotation, counter-clockwise
+    v = omega * dx
+
+    def _grid(field_2d: np.ndarray) -> xr.DataArray:
+        data = np.broadcast_to(field_2d[:, :, None, None], met.shape).astype("float64")
+        return xr.DataArray(data, coords=met.coords)
+
+    met["eastward_wind"] = _grid(u)
+    met["northward_wind"] = _grid(v)
+    met["lagrangian_tendency_of_air_pressure"] = _grid(np.zeros_like(u))
+    # Required by the model but unused by the pointwise centerline; constant values.
+    met["air_temperature"] = _grid(np.full_like(u, 220.0))
+    met["geopotential"] = _grid(np.full_like(u, 1.0e5))
+
+    # Start one radius east of the centre (initial wind is purely northward).
+    source = GeoVectorDataset(
+        longitude=[lon0 + radius / m_per_deg_lon],
+        latitude=[lat0],
+        level=[250.0],
+        time=[time[0]],
+    )
+
+    params = {
+        "azimuth": None,
+        "width": None,
+        "depth": None,
+        "max_age": np.timedelta64(3, "h"),
+        "dt_integration": np.timedelta64(5, "m"),
+    }
+    coarse = DryAdvection(met, params).eval(source)
+    fine = DryAdvection(met, {**params, "dt_integration": np.timedelta64(30, "s")}).eval(source)
+
+    def _endpoint(out: GeoVectorDataset) -> tuple[float, float]:
+        i = int(np.argmax(out["age"]))
+        return float(out["longitude"][i]), float(out["latitude"][i])
+
+    lon_c, lat_c = _endpoint(coarse)
+    lon_f, lat_f = _endpoint(fine)
+
+    geod = pyproj.Geod(ellps="WGS84")
+    _, _, error_m = geod.inv(lon_c, lat_c, lon_f, lat_f)
+    assert error_m <= 3.0
+
+    # Sanity: the parcel actually orbited rather than drifting off in a straight line
+    # (a straight 50 m/s path would be ~540 km from the centre after 3 h).
+    _, _, orbit_radius = geod.inv(lon0, lat0, lon_f, lat_f)
+    assert 0.8 * radius < orbit_radius < 1.2 * radius

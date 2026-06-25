@@ -293,8 +293,8 @@ def test_advection_near_poles() -> None:
         longitude, latitude, u_wind, v_wind, dt
     )
 
-    lon_new_expected = np.array([0.0, -90.0, 45.39, -155.0, 72.93, 44.62])
-    lat_new_expected = np.array([90.0, 85.0, 82.05, 89.92, -88.94, 81.95])
+    lon_new_expected = np.array([0.0, -90.0, 45.3874, -155.0, 72.9184, 44.6178])
+    lat_new_expected = np.array([90.0, 85.0, 82.0535, 89.924, -88.9449, 81.9461])
     np.testing.assert_allclose(longitude_new, lon_new_expected, rtol=1e-4)
     np.testing.assert_allclose(latitude_new, lat_new_expected, rtol=1e-4)
 
@@ -321,4 +321,31 @@ def test_compare_advection_methods() -> None:
     # And most longitude are close, but some are way off
     abs_err = np.abs((longitude_new - longitude_old + 180.0) % 360.0 - 180.0)
     assert abs_err.mean() < 0.5
-    assert abs_err.max() > 179.0
+    assert abs_err.max() > 178.0
+
+
+def test_advect_latitude_matches_wgs84_geodesic() -> None:
+    """Pure-north advection lands on the WGS-84 geodesic to within 5 m.
+
+    Acceptance test for the ellipsoidal meridional radius of curvature: marching
+    :func:`geo.advect_latitude` due north from the equator over 720 km must agree
+    with :meth:`pyproj.Geod.fwd` (WGS-84) to within 5 m, which a fixed spherical
+    radius cannot achieve (it is off by tens of metres over this distance).
+    """
+    speed = 50.0  # m/s
+    total_distance = 720_000.0  # m
+    dt = np.timedelta64(10, "s")
+    n_steps = round(total_distance / (speed * 10.0))
+
+    latitude = np.array([0.0])
+    v_wind = np.array([speed])
+    for _ in range(n_steps):
+        latitude = geo.advect_latitude(latitude, v_wind, dt)
+
+    geod = pyproj.Geod(ellps="WGS84")
+    _, lat_expected, _ = geod.fwd(0.0, 0.0, 0.0, total_distance)  # azimuth 0 = due north
+
+    # Convert the latitude discrepancy to a meridional ground distance.
+    m_per_deg = float(geo.meridional_radius_of_curvature(lat_expected)) * np.pi / 180.0
+    error_m = abs(float(latitude[0]) - lat_expected) * m_per_deg
+    assert error_m <= 5.0

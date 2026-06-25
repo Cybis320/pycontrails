@@ -742,13 +742,81 @@ def orbital_correction_for_solar_hour_angle(theta_rad: ArrayLike) -> ArrayLike:
 # ---------
 
 
+def prime_vertical_radius_of_curvature(
+    latitude: ArrayLike, altitude: npt.NDArray[np.floating] | float = 0.0
+) -> ArrayLike:
+    r"""Compute the WGS-84 prime-vertical (east-west) radius of curvature.
+
+    This is the local radius used to convert an east-west ground distance into a
+    longitude increment. The optional ``altitude`` raises the radius from the
+    ellipsoid surface to the particle height (a :math:`\sim 0.17\%` effect at
+    cruise altitude).
+
+    .. math::
+
+        N(\phi) = \frac{a}{\sqrt{1 - e^2 \sin^2\phi}}
+
+    Parameters
+    ----------
+    latitude : ArrayLike
+        Geodetic latitude, [:math:`\deg`]
+    altitude : npt.NDArray[np.floating] | float
+        Height above the ellipsoid, [:math:`m`]. Defaults to 0 (ellipsoid surface).
+
+    Returns
+    -------
+    ArrayLike
+        Prime-vertical radius of curvature plus ``altitude``, [:math:`m`]
+    """
+    sin2 = np.sin(units.degrees_to_radians(latitude)) ** 2
+    n = constants.WGS84_a / np.sqrt(1.0 - constants.WGS84_e2 * sin2)
+    return n + altitude  # type: ignore[return-value]
+
+
+def meridional_radius_of_curvature(
+    latitude: ArrayLike, altitude: npt.NDArray[np.floating] | float = 0.0
+) -> ArrayLike:
+    r"""Compute the WGS-84 meridional (north-south) radius of curvature.
+
+    This is the local radius used to convert a north-south ground distance into a
+    latitude increment. The optional ``altitude`` raises the radius from the
+    ellipsoid surface to the particle height (a :math:`\sim 0.17\%` effect at
+    cruise altitude).
+
+    .. math::
+
+        M(\phi) = \frac{a (1 - e^2)}{(1 - e^2 \sin^2\phi)^{3/2}}
+
+    Parameters
+    ----------
+    latitude : ArrayLike
+        Geodetic latitude, [:math:`\deg`]
+    altitude : npt.NDArray[np.floating] | float
+        Height above the ellipsoid, [:math:`m`]. Defaults to 0 (ellipsoid surface).
+
+    Returns
+    -------
+    ArrayLike
+        Meridional radius of curvature plus ``altitude``, [:math:`m`]
+    """
+    sin2 = np.sin(units.degrees_to_radians(latitude)) ** 2
+    m = constants.WGS84_a * (1.0 - constants.WGS84_e2) / (1.0 - constants.WGS84_e2 * sin2) ** 1.5
+    return m + altitude  # type: ignore[return-value]
+
+
 def advect_longitude(
     longitude: ArrayLike,
     latitude: ArrayLike,
     u_wind: ArrayLike,
     dt: npt.NDArray[np.timedelta64] | np.timedelta64,
+    altitude: npt.NDArray[np.floating] | float = 0.0,
 ) -> ArrayLike:
     r"""Calculate the longitude of a particle after time `dt` caused by advection due to wind.
+
+    Uses the latitude-dependent WGS-84 prime-vertical radius of curvature
+    (:func:`prime_vertical_radius_of_curvature`) rather than a fixed spherical
+    radius, so the east-west ground distance maps to the correct longitude
+    increment on the ellipsoid.
 
     Automatically wrap over the antimeridian if necessary.
 
@@ -762,6 +830,8 @@ def advect_longitude(
         Wind speed in the longitudinal direction, [:math:`m s^{-1}`]
     dt : np.ndarray
         Advection timestep
+    altitude : npt.NDArray[np.floating] | float
+        Particle height above the ellipsoid, [:math:`m`]. Defaults to 0.
 
     Returns
     -------
@@ -774,7 +844,11 @@ def advect_longitude(
 
     distance_m = u_wind * dt_s
 
-    new_longitude = longitude + units.m_to_longitude_distance(distance_m, latitude)
+    r_ew = prime_vertical_radius_of_curvature(latitude, altitude)
+    cos_lat = np.cos(units.degrees_to_radians(latitude))
+    delta_lon = units.radians_to_degrees(distance_m / (r_ew * cos_lat))
+
+    new_longitude = longitude + delta_lon
     return (new_longitude + 180.0) % 360.0 - 180.0  # wrap antimeridian
 
 
@@ -782,8 +856,14 @@ def advect_latitude(
     latitude: ArrayLike,
     v_wind: ArrayLike,
     dt: npt.NDArray[np.timedelta64] | np.timedelta64,
+    altitude: npt.NDArray[np.floating] | float = 0.0,
 ) -> ArrayLike:
     r"""Calculate the latitude of a particle after time ``dt`` caused by advection due to wind.
+
+    Uses the latitude-dependent WGS-84 meridional radius of curvature
+    (:func:`meridional_radius_of_curvature`) rather than a fixed spherical radius,
+    so the north-south ground distance maps to the correct latitude increment on
+    the ellipsoid.
 
     .. note::
 
@@ -804,6 +884,8 @@ def advect_latitude(
         Wind speed in the latitudinal direction, [:math:`m s^{-1}`]
     dt : np.ndarray
         Advection time delta
+    altitude : npt.NDArray[np.floating] | float
+        Particle height above the ellipsoid, [:math:`m`]. Defaults to 0.
 
     Returns
     -------
@@ -816,7 +898,8 @@ def advect_latitude(
 
     distance_m = v_wind * dt_s
 
-    return latitude + units.m_to_latitude_distance(distance_m)
+    r_ns = meridional_radius_of_curvature(latitude, altitude)
+    return latitude + units.radians_to_degrees(distance_m / r_ns)
 
 
 def advect_level(
@@ -861,6 +944,7 @@ def advect_longitude_and_latitude_near_poles(
     u_wind: npt.NDArray[np.floating],
     v_wind: npt.NDArray[np.floating],
     dt: npt.NDArray[np.timedelta64] | np.timedelta64,
+    altitude: npt.NDArray[np.floating] | float = 0.0,
 ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
     r"""Advect a particle near the poles.
 
@@ -911,11 +995,14 @@ def advect_longitude_and_latitude_near_poles(
     y_cartesian = -cos_lon_rad * polar_radius * hemisphere_sign
 
     # Convert winds from eastward and northward direction (u, v) to (X, Y), [:math:`\deg s^{-1}`]
+    # Near the poles the meridional and prime-vertical radii agree to < 0.3%, so the
+    # WGS-84 meridional radius is used for the polar-distance conversion in both axes.
+    radius = meridional_radius_of_curvature(latitude, altitude)
     x_wind = units.radians_to_degrees(
-        (u_wind * cos_lon_rad - v_wind * sin_lon_rad * hemisphere_sign) / constants.radius_earth
+        (u_wind * cos_lon_rad - v_wind * sin_lon_rad * hemisphere_sign) / radius
     )
     y_wind = units.radians_to_degrees(
-        (u_wind * sin_lon_rad * hemisphere_sign + v_wind * cos_lon_rad) / constants.radius_earth
+        (u_wind * sin_lon_rad * hemisphere_sign + v_wind * cos_lon_rad) / radius
     )
 
     # Advect contrails in 2-D Cartesian-like plane, [:math:`\deg`]
@@ -947,6 +1034,7 @@ def advect_horizontal(
     u_wind: npt.NDArray[np.floating],
     v_wind: npt.NDArray[np.floating],
     dt: npt.NDArray[np.timedelta64] | np.timedelta64,
+    altitude: npt.NDArray[np.floating] | float = 0.0,
 ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
     r"""Advect a particle in the horizontal plane.
 
@@ -967,6 +1055,8 @@ def advect_horizontal(
         Wind speed in the latitudinal direction, [:math:`m s^{-1}`]
     dt : npt.NDArray[np.timedelta64] | np.timedelta64
         Advection timestep
+    altitude : npt.NDArray[np.floating] | float
+        Particle height above the ellipsoid, [:math:`m`]. Defaults to 0.
 
     Returns
     -------
@@ -978,15 +1068,16 @@ def advect_horizontal(
     longitude_out = np.empty_like(longitude)
     latitude_out = np.empty_like(latitude)
 
-    # Use simple spherical advection if position is far from the poles (<= 80.0 degrees)
+    # Use ellipsoidal advection if position is far from the poles (<= 80.0 degrees)
     cond = ~near_poles
     lon_cond = longitude[cond]
     lat_cond = latitude[cond]
     u_wind_cond = u_wind[cond]
     v_wind_cond = v_wind[cond]
     dt_cond = dt if isinstance(dt, np.timedelta64) else dt[cond]
-    longitude_out[cond] = advect_longitude(lon_cond, lat_cond, u_wind_cond, dt_cond)
-    latitude_out[cond] = advect_latitude(lat_cond, v_wind_cond, dt_cond)
+    alt_cond = altitude[cond] if isinstance(altitude, np.ndarray) else altitude
+    longitude_out[cond] = advect_longitude(lon_cond, lat_cond, u_wind_cond, dt_cond, alt_cond)
+    latitude_out[cond] = advect_latitude(lat_cond, v_wind_cond, dt_cond, alt_cond)
 
     # And use Cartesian-like advection if position is near the poles (> 80.0 degrees)
     cond = near_poles
@@ -995,8 +1086,9 @@ def advect_horizontal(
     u_wind_cond = u_wind[cond]
     v_wind_cond = v_wind[cond]
     dt_cond = dt if isinstance(dt, np.timedelta64) else dt[cond]
+    alt_cond = altitude[cond] if isinstance(altitude, np.ndarray) else altitude
     lon_out_cond, lat_out_cond = advect_longitude_and_latitude_near_poles(
-        lon_cond, lat_cond, u_wind_cond, v_wind_cond, dt_cond
+        lon_cond, lat_cond, u_wind_cond, v_wind_cond, dt_cond, alt_cond
     )
     longitude_out[cond] = lon_out_cond
     latitude_out[cond] = lat_out_cond
