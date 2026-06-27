@@ -654,9 +654,11 @@ def _advect_centerline_rk4(
         New longitude, latitude and pressure level, [:math:`\deg`, :math:`\deg`,
         :math:`hPa`].
     """
-    # ``q_method`` only applies to specific-humidity interpolation; drop it so the
-    # wind/omega kwargs are accepted by ``intersect_met`` (a fresh local dict).
+    # ``q_method`` and ``use_indices`` belong to the high-level interpolation glue;
+    # drop them so the remaining kwargs are accepted by ``MetDataArray.interpolate``,
+    # which is called directly below to share grid indices (a fresh local dict).
     interp_kwargs.pop("q_method", None)
+    interp_kwargs.pop("use_indices", None)
 
     # float64 accumulation (a float32 coordinate random-walks over hundreds of steps)
     lon0 = vector["longitude"].astype(np.float64)
@@ -692,15 +694,26 @@ def _advect_centerline_rk4(
         dlev = (w + extra_dp_dt) / 100.0
         return dlon, dlat, dlev
 
+    # Index reuse (below) is only supported with localize=False (the default).
+    share_indices = not interp_kwargs.get("localize", False)
+
     def interp(
         lon: np.ndarray, lat: np.ndarray, lev: np.ndarray, time: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        kw = {"longitude": lon, "latitude": lat, "level": lev, "time": time, **interp_kwargs}
-        return (
-            vector.intersect_met(u_mda, **kw),
-            vector.intersect_met(v_mda, **kw),
-            vector.intersect_met(w_mda, **kw),
-        )
+        if not share_indices:
+            return (
+                u_mda.interpolate(lon, lat, lev, time, **interp_kwargs),
+                v_mda.interpolate(lon, lat, lev, time, **interp_kwargs),
+                w_mda.interpolate(lon, lat, lev, time, **interp_kwargs),
+            )
+        # u, v and omega share the met grid and are sampled at the same 4-D point, so
+        # the grid-index search (``_find_indices``, the dominant interpolation cost) is
+        # done once and reused for the other two. This is bit-identical to
+        # interpolating each variable independently.
+        u, idx = u_mda.interpolate(lon, lat, lev, time, return_indices=True, **interp_kwargs)
+        v = v_mda.interpolate(lon, lat, lev, time, indices=idx, **interp_kwargs)
+        w = w_mda.interpolate(lon, lat, lev, time, indices=idx, **interp_kwargs)
+        return u, v, w
 
     # Stage 1 reuses the once-per-step interpolation already attached to ``vector``.
     k1 = rates(lon0, lat0, lev0, vector["u_wind"], vector["v_wind"], vector["vertical_velocity"])
