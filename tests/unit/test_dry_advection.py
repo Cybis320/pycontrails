@@ -372,3 +372,59 @@ def test_dry_advection_downwash_displacement() -> None:
 
     # ...and the descent is independent of the integration step.
     assert drop_30m == pytest.approx(drop_5m, abs=1e-6)
+
+
+def test_dry_advection_sedimentation_density_aware() -> None:
+    """Sedimentation sinks the plume at the hydrostatic rate rho*g*v_fall.
+
+    In a still atmosphere the only level change is sedimentation. The pressure
+    descent over a step equals rho*g*v_fall*dt, so -- unlike a fixed Pa/s knob -- a
+    fixed fall speed sinks a denser, lower-altitude parcel faster in pressure.
+    """
+    t_air = 220.0
+    lon0, lat0 = 0.0, 45.0
+    longitude = np.arange(lon0 - 1.0, lon0 + 1.01, 0.5)
+    latitude = np.arange(lat0 - 1.0, lat0 + 1.01, 0.5)
+    # Wide level range so sedimenting parcels stay inside the met pressure domain.
+    level = np.array([150.0, 200.0, 250.0, 300.0, 350.0])
+    time = np.array(["2022-01-01T00:00:00", "2022-01-01T06:00:00"], dtype="datetime64[ns]")
+
+    met = MetDataset.from_coords(longitude=longitude, latitude=latitude, level=level, time=time)
+    met["eastward_wind"] = xr.DataArray(np.zeros(met.shape), coords=met.coords)
+    met["northward_wind"] = xr.DataArray(np.zeros(met.shape), coords=met.coords)
+    met["lagrangian_tendency_of_air_pressure"] = xr.DataArray(
+        np.zeros(met.shape), coords=met.coords
+    )
+    met["air_temperature"] = xr.DataArray(np.full(met.shape, t_air), coords=met.coords)
+    met["geopotential"] = xr.DataArray(np.full(met.shape, 1.0e5), coords=met.coords)
+
+    v_fall = 0.1  # m/s
+    dt = np.timedelta64(10, "m")
+    dt_s = dt / np.timedelta64(1, "s")
+
+    def one_step_drop(level0: float, velocity: float) -> float:
+        src = GeoVectorDataset(longitude=[lon0], latitude=[lat0], level=[level0], time=[time[0]])
+        params = {
+            "azimuth": None,
+            "width": None,
+            "depth": None,
+            "max_age": dt,
+            "dt_integration": dt,
+            "sedimentation_velocity": velocity,
+        }
+        out = DryAdvection(met, params).eval(src)
+        return float(out["level"][int(np.argmax(out["age"]))]) - level0
+
+    # No sedimentation: the level is unchanged in a still atmosphere.
+    assert one_step_drop(250.0, 0.0) == pytest.approx(0.0, abs=1e-6)
+
+    # The descent over one step equals the hydrostatic rho*g*v*dt at the parcel level.
+    for lev0 in (200.0, 250.0, 300.0):
+        rho = (lev0 * 100.0) / (287.05 * t_air)
+        expected = rho * 9.80665 * v_fall * dt_s / 100.0  # hPa
+        assert one_step_drop(lev0, v_fall) == pytest.approx(expected, rel=1e-3)
+
+    # Density-aware: a denser parcel (300 hPa) sinks 1.5x faster in pressure than a
+    # 200 hPa parcel for the same fall speed -- a fixed Pa/s rate would give 1.0.
+    ratio = one_step_drop(300.0, v_fall) / one_step_drop(200.0, v_fall)
+    assert ratio == pytest.approx(1.5, rel=1e-3)

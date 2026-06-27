@@ -30,7 +30,7 @@ from pycontrails.core.met_var import (
 )
 from pycontrails.core.vector import GeoVectorDataset
 from pycontrails.models.cocip import contrail_properties, wind_shear
-from pycontrails.physics import geo, thermo, units
+from pycontrails.physics import constants, geo, thermo, units
 
 
 @dataclasses.dataclass
@@ -50,8 +50,12 @@ class DryAdvectionParams(models.AdvectionBuffers):
     #: .. versionadded:: 0.54.11
     timesteps: npt.NDArray[np.datetime64] | None = None
 
-    #: Rate of change of pressure due to sedimentation [:math:`Pa/s`]
-    sedimentation_rate: float = 0.0
+    #: Constant terminal fall speed of the plume due to sedimentation,
+    #: [:math:`m \ s^{-1}`]. Positive values sink the plume. The pressure tendency
+    #: is computed per parcel as :math:`\rho g v` (density-aware), so a fixed fall
+    #: speed sinks a denser, lower-altitude parcel faster in pressure. Defaults to 0
+    #: (no sedimentation).
+    sedimentation_velocity: float = 0.0
 
     #: Difference in altitude between top and bottom layer for stratification calculations,
     #: [:math:`m`]. Used to approximate derivative of "lagrangian_tendency_of_air_pressure"
@@ -100,9 +104,10 @@ class DryAdvectionParams(models.AdvectionBuffers):
 class DryAdvection(models.Model):
     """Simulate "dry advection" of an emissions plume with an elliptical cross section.
 
-    The model simulates both horizontal and vertical advection of a weightless
-    plume without any sedimentation effects. Unlike :class:`Cocip`, humidity is
-    not considered, and radiative forcing is not simulated. The model is
+    The model simulates horizontal and vertical advection of a plume, with optional
+    constant-fall-speed sedimentation (off by default, see
+    :attr:`DryAdvectionParams.sedimentation_velocity`). Unlike :class:`Cocip`,
+    humidity is not considered, and radiative forcing is not simulated. The model is
     therefore useful simulating plume advection and dispersion itself.
 
     .. versionadded:: 0.46.0
@@ -134,7 +139,7 @@ class DryAdvection(models.Model):
     """
 
     name = "dry_advection"
-    long_name = "Emission plume advection without sedimentation"
+    long_name = "Emission plume advection with optional sedimentation"
     met_variables: tuple[MetVariable, ...] = (
         AirTemperature,
         EastwardWind,
@@ -160,7 +165,7 @@ class DryAdvection(models.Model):
     def eval(
         self, source: GeoVectorDataset | Sequence[Flight] | None = None, **params: Any
     ) -> GeoVectorDataset | list[Flight]:
-        """Simulate dry advection (no sedimentation) of arbitrary points.
+        """Simulate dry advection of arbitrary points.
 
         Like :class:`Cocip`, this model adds a "waypoint" column to the :attr:`source`.
 
@@ -215,7 +220,7 @@ class DryAdvection(models.Model):
 
         interp_kwargs = self.interp_kwargs
 
-        sedimentation_rate = self.params["sedimentation_rate"]
+        sedimentation_velocity = self.params["sedimentation_velocity"]
         dz_m = self.params["dz_m"]
         max_depth = self.params["max_depth"]
         verbose_outputs = self.params["verbose_outputs"]
@@ -262,7 +267,7 @@ class DryAdvection(models.Model):
                 met,
                 vector1,
                 t,
-                sedimentation_rate=sedimentation_rate,
+                sedimentation_velocity=sedimentation_velocity,
                 dz_m=dz_m,
                 max_depth=max_depth,
                 verbose_outputs=verbose_outputs,
@@ -378,7 +383,7 @@ def _perform_interp_for_step(
     met: MetDataset,
     vector: GeoVectorDataset,
     dz_m: float,
-    downwash_enabled: bool = False,
+    need_air_temperature: bool = False,
     **interp_kwargs: Any,
 ) -> None:
     """Perform all interpolation required for one step of advection."""
@@ -398,8 +403,9 @@ def _perform_interp_for_step(
 
     az = vector.get("azimuth")
 
-    # Interpolate air_temperature if needed for downwash (even in pointwise mode)
-    if downwash_enabled and az is None:
+    # Interpolate air_temperature when a vertical term (downwash or sedimentation)
+    # needs air density, even in pointwise mode.
+    if need_air_temperature and az is None:
         models.interpolate_met(met, vector, "air_temperature", **interp_kwargs)
 
     if az is None:
@@ -620,8 +626,8 @@ def _advect_centerline_rk4(
     RK4 stages (start, two midpoints, end) and the intermediate positions. This
     replaces the previous forward-Euler step, which froze the wind at the start of
     the step and accrued kilometre-scale error over 1-3 h in curving flow.
-    ``extra_dp_dt`` is the per-step-constant pressure tendency from sedimentation
-    (and optional downwash), [:math:`Pa \ s^{-1}`].
+    ``extra_dp_dt`` is the per-step-constant pressure tendency from sedimentation,
+    [:math:`Pa \ s^{-1}`].
 
     Coordinates accumulate in ``float64`` to avoid a random-walk error over the many
     steps of a multi-hour integration.
@@ -723,7 +729,7 @@ def _evolve_one_step(
     vector: GeoVectorDataset,
     t: np.datetime64,
     *,
-    sedimentation_rate: float,
+    sedimentation_velocity: float,
     dz_m: float,
     max_depth: float | None,
     verbose_outputs: bool,
@@ -735,14 +741,27 @@ def _evolve_one_step(
     This method mutates the input ``vector`` in place.
     """
 
+    # Both downwash and sedimentation need air density (rho = p / (R_d T)), so they
+    # require an interpolated air temperature even in pointwise mode.
+    sedimentation_enabled = sedimentation_velocity != 0.0
     downwash_enabled = downwash_distance is not None
-    _perform_interp_for_step(met, vector, dz_m, downwash_enabled=downwash_enabled, **interp_kwargs)
+    need_air_temperature = sedimentation_enabled or downwash_enabled
+    _perform_interp_for_step(
+        met, vector, dz_m, need_air_temperature=need_air_temperature, **interp_kwargs
+    )
+
+    # Sedimentation as a density-aware pressure tendency rho*g*v (Pa/s). Recomputed
+    # each step from the parcel's current density, then integrated by the RK4.
+    extra_dp_dt: npt.NDArray[np.floating] | float = 0.0
+    if sedimentation_enabled:
+        rho_air = vector["air_pressure"] / (constants.R_d * vector["air_temperature"])
+        extra_dp_dt = rho_air * constants.g * sedimentation_velocity
 
     dt = t - vector["time"]
     # Integrate the centerline with classical RK4 (re-interpolating the wind at each
     # stage) rather than freezing the start-of-step wind (forward Euler).
     longitude_2, latitude_2, level_2 = _advect_centerline_rk4(
-        met, vector, t, extra_dp_dt=sedimentation_rate, **interp_kwargs
+        met, vector, t, extra_dp_dt=extra_dp_dt, **interp_kwargs
     )
 
     # Wake-vortex downwash: a one-time descent by ``downwash_distance`` applied at
@@ -750,10 +769,8 @@ def _evolve_one_step(
     # one-shot offset rather than a per-step velocity, the descent is independent of
     # ``dt_integration``.
     if downwash_distance is not None:
-        r_air = 287.05  # specific gas constant for dry air, [J kg-1 K-1]
-        g = 9.80665  # gravitational acceleration, [m s-2]
-        rho_air = vector["air_pressure"] / (r_air * vector["air_temperature"])
-        delta_level = rho_air * g * downwash_distance / 100.0  # hydrostatic, [hPa]
+        rho_air = vector["air_pressure"] / (constants.R_d * vector["air_temperature"])
+        delta_level = rho_air * constants.g * downwash_distance / 100.0  # hydrostatic, [hPa]
         is_formation = vector["age"] == np.timedelta64(0, "ns")
         level_2 = level_2 + np.where(is_formation, delta_level, 0.0)
 
