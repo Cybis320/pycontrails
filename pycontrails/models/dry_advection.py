@@ -82,23 +82,19 @@ class DryAdvectionParams(models.AdvectionBuffers):
     #: source points as well as evolved points.
     include_source_in_output: bool = False
 
-    #: Apply simplified constant downwash to source waypoints.
-    #: If True, source waypoints are displaced downward by :attr:`downwash_distance`
-    #: before advection begins, simulating wake vortex descent.
+    #: Apply a simplified wake-vortex downwash. If True, each waypoint is displaced
+    #: downward once by :attr:`downwash_distance` at formation (age 0), approximating
+    #: the descent of the wake vortices before they break up. The descent is applied
+    #: as a single hydrostatic level offset, so it is independent of
+    #: :attr:`dt_integration`.
     #: .. versionadded:: 0.54.12
     apply_downwash: bool = False
 
-    #: Downward displacement distance for simplified downwash model, [:math:`m`].
-    #: Only applies when :attr:`apply_downwash` is True.
-    #: Default of 300m represents typical wake vortex descent.
+    #: Downward displacement applied once at formation when :attr:`apply_downwash`
+    #: is True, [:math:`m`]. The default of 300 m is a representative wake-vortex
+    #: descent depth.
     #: .. versionadded:: 0.54.12
     downwash_distance: float = 300.0
-
-    #: Duration over which downwash occurs.
-    #: Downwash is applied linearly from waypoint creation time until
-    #: creation_time + downwash_duration, reaching :attr:`downwash_distance`.
-    #: .. versionadded:: 0.54.12
-    downwash_duration: np.timedelta64 = np.timedelta64(1, "m")
 
 
 class DryAdvection(models.Model):
@@ -124,9 +120,8 @@ class DryAdvection(models.Model):
 
     .. versionadded:: 0.54.12
 
-        Added simplified downwash support via ``apply_downwash`` parameter.
-        When enabled, waypoints descend linearly over ``downwash_duration``
-        (default 1 minute) to simulate wake vortex descent.
+        Added a simplified wake-vortex downwash via ``apply_downwash``. When enabled,
+        each waypoint descends once by ``downwash_distance`` at formation.
 
     Parameters
     ----------
@@ -258,13 +253,10 @@ class DryAdvection(models.Model):
             t0 = vector1["time"].min()
             met = maybe_downselect_mds(self.met, met, t0, t)
 
-            # Calculate downwash parameters if enabled
-            downwash_params = None
-            if self.params["apply_downwash"]:
-                downwash_params = {
-                    "distance": self.params["downwash_distance"],
-                    "duration": self.params["downwash_duration"],
-                }
+            # One-time wake-vortex downwash distance (m), or None if disabled.
+            downwash_distance = (
+                self.params["downwash_distance"] if self.params["apply_downwash"] else None
+            )
 
             vector2 = _evolve_one_step(
                 met,
@@ -274,7 +266,7 @@ class DryAdvection(models.Model):
                 dz_m=dz_m,
                 max_depth=max_depth,
                 verbose_outputs=verbose_outputs,
-                downwash_params=downwash_params,
+                downwash_distance=downwash_distance,
                 **interp_kwargs,
             )
 
@@ -735,7 +727,7 @@ def _evolve_one_step(
     dz_m: float,
     max_depth: float | None,
     verbose_outputs: bool,
-    downwash_params: dict[str, Any] | None = None,
+    downwash_distance: float | None = None,
     **interp_kwargs: Any,
 ) -> GeoVectorDataset:
     """Evolve plume geometry by one step.
@@ -743,59 +735,27 @@ def _evolve_one_step(
     This method mutates the input ``vector`` in place.
     """
 
-    downwash_enabled = downwash_params is not None
+    downwash_enabled = downwash_distance is not None
     _perform_interp_for_step(met, vector, dz_m, downwash_enabled=downwash_enabled, **interp_kwargs)
-
-    # Per-step-constant pressure tendency (Pa/s) added to the interpolated vertical
-    # velocity at every RK4 stage: sedimentation plus optional downwash.
-    extra_dp_dt: npt.NDArray[np.floating] | float = sedimentation_rate
-
-    # Apply downwash as additional vertical velocity if enabled
-    if downwash_params is not None:
-        downwash_distance = downwash_params["distance"]
-        downwash_duration = downwash_params["duration"]
-
-        # Calculate age-dependent downwash velocity
-        # Linear decrease: v(age) = 2*D/T * (1 - age/T) for age < T
-        age = vector["age"]
-        age_seconds = age / np.timedelta64(1, "s")
-        duration_seconds = downwash_duration / np.timedelta64(1, "s")
-
-        # Fraction of duration elapsed (clamped to [0, 1])
-        age_fraction = np.minimum(age_seconds / duration_seconds, 1.0)
-
-        # Downwash velocity (m/s), linearly decreasing from 2*D/T to 0
-        # Using 2*D/T ensures total descent = D over duration T
-        max_downwash_velocity = 2.0 * downwash_distance / duration_seconds
-        downwash_velocity = max_downwash_velocity * (1.0 - age_fraction)
-
-        # Convert to pressure velocity (Pa/s) using hydrostatic relation
-        # dp/dz = -rho*g, where rho = p/(R*T) from ideal gas law
-        air_pressure = vector["air_pressure"]
-        air_temperature = vector["air_temperature"]
-
-        # Constants
-        R_air = 287.05  # J/(kg·K) - specific gas constant for dry air
-        g = 9.80665  # m/s² - gravitational acceleration
-
-        # Air density from ideal gas law
-        rho_air = air_pressure / (R_air * air_temperature)
-
-        # Pressure gradient: dp/dz = -rho*g
-        dp_dz = -rho_air * g  # Pa/m
-
-        # Convert downwash velocity to pressure rate
-        # Negative velocity (descent) gives positive pressure rate
-        downwash_pressure_rate = dp_dz * (-downwash_velocity)
-
-        extra_dp_dt = extra_dp_dt + downwash_pressure_rate
 
     dt = t - vector["time"]
     # Integrate the centerline with classical RK4 (re-interpolating the wind at each
     # stage) rather than freezing the start-of-step wind (forward Euler).
     longitude_2, latitude_2, level_2 = _advect_centerline_rk4(
-        met, vector, t, extra_dp_dt=extra_dp_dt, **interp_kwargs
+        met, vector, t, extra_dp_dt=sedimentation_rate, **interp_kwargs
     )
+
+    # Wake-vortex downwash: a one-time descent by ``downwash_distance`` applied at
+    # formation (age == 0) as a single hydrostatic level offset. Because it is a
+    # one-shot offset rather than a per-step velocity, the descent is independent of
+    # ``dt_integration``.
+    if downwash_distance is not None:
+        r_air = 287.05  # specific gas constant for dry air, [J kg-1 K-1]
+        g = 9.80665  # gravitational acceleration, [m s-2]
+        rho_air = vector["air_pressure"] / (r_air * vector["air_temperature"])
+        delta_level = rho_air * g * downwash_distance / 100.0  # hydrostatic, [hPa]
+        is_formation = vector["age"] == np.timedelta64(0, "ns")
+        level_2 = level_2 + np.where(is_formation, delta_level, 0.0)
 
     out = GeoVectorDataset._from_fastpath(
         {

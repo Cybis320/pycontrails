@@ -315,3 +315,60 @@ def test_dry_advection_rk4_solid_body_rotation() -> None:
     # (a straight 50 m/s path would be ~540 km from the centre after 3 h).
     _, _, orbit_radius = geod.inv(lon0, lat0, lon_f, lat_f)
     assert 0.8 * radius < orbit_radius < 1.2 * radius
+
+
+def test_dry_advection_downwash_displacement() -> None:
+    """Wake-vortex downwash is a fixed descent at formation, independent of dt.
+
+    In a still atmosphere (no wind, no vertical velocity) the only level change is
+    the downwash. Enabling it sinks each waypoint once by the hydrostatic
+    pressure-equivalent of ``downwash_distance``, and the descent is the same for any
+    ``dt_integration`` — the property the previous per-step-velocity model lacked
+    (which over-descended ~60x at the 30 min default).
+    """
+    lon0, lat0, lev0 = 0.0, 45.0, 250.0
+    t_air = 220.0
+    longitude = np.arange(lon0 - 1.0, lon0 + 1.01, 0.5)
+    latitude = np.arange(lat0 - 1.0, lat0 + 1.01, 0.5)
+    level = np.array([200.0, 250.0, 300.0])
+    time = np.array(["2022-01-01T00:00:00", "2022-01-01T06:00:00"], dtype="datetime64[ns]")
+
+    met = MetDataset.from_coords(longitude=longitude, latitude=latitude, level=level, time=time)
+    met["eastward_wind"] = xr.DataArray(np.zeros(met.shape), coords=met.coords)
+    met["northward_wind"] = xr.DataArray(np.zeros(met.shape), coords=met.coords)
+    met["lagrangian_tendency_of_air_pressure"] = xr.DataArray(
+        np.zeros(met.shape), coords=met.coords
+    )
+    met["air_temperature"] = xr.DataArray(np.full(met.shape, t_air), coords=met.coords)
+    met["geopotential"] = xr.DataArray(np.full(met.shape, 1.0e5), coords=met.coords)
+
+    distance = 300.0
+    # Expected one-time descent in hPa from the hydrostatic relation the model uses.
+    rho = (lev0 * 100.0) / (287.05 * t_air)
+    expected_drop = rho * 9.80665 * distance / 100.0
+
+    def final_level(dt: np.timedelta64, apply: bool) -> float:
+        src = GeoVectorDataset(longitude=[lon0], latitude=[lat0], level=[lev0], time=[time[0]])
+        params = {
+            "azimuth": None,
+            "width": None,
+            "depth": None,
+            "max_age": np.timedelta64(1, "h"),
+            "dt_integration": dt,
+            "apply_downwash": apply,
+            "downwash_distance": distance,
+        }
+        out = DryAdvection(met, params).eval(src)
+        return float(out["level"][int(np.argmax(out["age"]))])
+
+    # No downwash: the level is unchanged in a still atmosphere.
+    assert final_level(np.timedelta64(30, "m"), apply=False) == pytest.approx(lev0, abs=1e-6)
+
+    # Downwash: the parcel descends once by the expected hydrostatic amount...
+    drop_30m = final_level(np.timedelta64(30, "m"), apply=True) - lev0
+    drop_5m = final_level(np.timedelta64(5, "m"), apply=True) - lev0
+    assert drop_30m == pytest.approx(expected_drop, abs=0.05)
+    assert expected_drop == pytest.approx(11.6, abs=0.5)  # ~300 m at 250 hPa
+
+    # ...and the descent is independent of the integration step.
+    assert drop_30m == pytest.approx(drop_5m, abs=1e-6)
