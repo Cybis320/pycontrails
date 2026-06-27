@@ -19,7 +19,7 @@ import pandas as pd
 from pycontrails.core import models
 from pycontrails.core.fleet import Fleet
 from pycontrails.core.flight import Flight
-from pycontrails.core.met import MetDataset, maybe_downselect_mds
+from pycontrails.core.met import MetDataArray, MetDataset, maybe_downselect_mds
 from pycontrails.core.met_var import (
     AirTemperature,
     EastwardWind,
@@ -379,6 +379,44 @@ class DryAdvection(models.Model):
         self.met = self.source.downselect_met(self.met, **buffers)
 
 
+def _interp_colocated(
+    mdas: list[MetDataArray],
+    longitude: np.ndarray,
+    latitude: np.ndarray,
+    level: np.ndarray,
+    time: np.ndarray,
+    **interp_kwargs: Any,
+) -> list[np.ndarray]:
+    """Interpolate several co-located met variables, searching the grid once.
+
+    All ``mdas`` share the met grid and are sampled at the same 4-D point, so the
+    grid-index search (``_find_indices``, the dominant interpolation cost) is done
+    once and reused for the remaining variables. This is bit-identical to
+    interpolating each variable independently.
+
+    Index reuse is unsupported with ``localize=True``; in that case each variable is
+    interpolated independently. ``interp_kwargs`` must not contain ``q_method`` or
+    ``use_indices`` (those belong to the high-level interpolation glue, not
+    :meth:`MetDataArray.interpolate`).
+    """
+    share = not interp_kwargs.get("localize", False)
+    out: list[np.ndarray] = []
+    idx = None
+    for mda in mdas:
+        if not share:
+            out.append(mda.interpolate(longitude, latitude, level, time, **interp_kwargs))
+        elif idx is None:
+            val, idx = mda.interpolate(
+                longitude, latitude, level, time, return_indices=True, **interp_kwargs
+            )
+            out.append(val)
+        else:
+            out.append(
+                mda.interpolate(longitude, latitude, level, time, indices=idx, **interp_kwargs)
+            )
+    return out
+
+
 def _perform_interp_for_step(
     met: MetDataset,
     vector: GeoVectorDataset,
@@ -388,58 +426,63 @@ def _perform_interp_for_step(
 ) -> None:
     """Perform all interpolation required for one step of advection."""
 
+    # Calling MetDataArray.interpolate directly (to share grid indices), so drop the
+    # high-level-only kwargs.
+    interp_kwargs.pop("q_method", None)
+    interp_kwargs.pop("use_indices", None)
+
     vector.setdefault("level", vector.level)
     air_pressure = vector.setdefault("air_pressure", vector.air_pressure)
 
-    models.interpolate_met(met, vector, "northward_wind", "v_wind", **interp_kwargs)
-    models.interpolate_met(met, vector, "eastward_wind", "u_wind", **interp_kwargs)
-    models.interpolate_met(
-        met,
-        vector,
-        "lagrangian_tendency_of_air_pressure",
-        "vertical_velocity",
-        **interp_kwargs,
-    )
-
     az = vector.get("azimuth")
+    # Geometry mode (azimuth set) always needs air_temperature; pointwise needs it
+    # only for a vertical term (downwash or sedimentation).
+    want_temperature = need_air_temperature or az is not None
 
-    # Interpolate air_temperature when a vertical term (downwash or sedimentation)
-    # needs air density, even in pointwise mode.
-    if need_air_temperature and az is None:
-        models.interpolate_met(met, vector, "air_temperature", **interp_kwargs)
+    def store_group(
+        specs: list[tuple[str, str]],
+        *,
+        longitude: np.ndarray | None = None,
+        latitude: np.ndarray | None = None,
+        level: np.ndarray | None = None,
+    ) -> None:
+        """Interpolate a co-located group of (met_key, vector_key) pairs and store it."""
+        lon = longitude if longitude is not None else vector["longitude"]
+        lat = latitude if latitude is not None else vector["latitude"]
+        lev = level if level is not None else vector.level
+        mdas = [met[met_key] for met_key, _ in specs]
+        vals = _interp_colocated(mdas, lon, lat, lev, vector["time"], **interp_kwargs)
+        for (_, vector_key), val in zip(specs, vals, strict=True):
+            vector[vector_key] = val
+
+    # Start point: winds and omega (plus air_temperature when needed). All sampled at
+    # the waypoint, so the grid index is shared across them.
+    start = [
+        ("northward_wind", "v_wind"),
+        ("eastward_wind", "u_wind"),
+        ("lagrangian_tendency_of_air_pressure", "vertical_velocity"),
+    ]
+    if want_temperature:
+        start.append(("air_temperature", "air_temperature"))
+    store_group(start)
 
     if az is None:
         # Early exit for pointwise only simulation
         return
 
-    air_temperature = models.interpolate_met(met, vector, "air_temperature", **interp_kwargs)
+    air_temperature = vector["air_temperature"]
     air_pressure_lower = thermo.pressure_dz(air_temperature, air_pressure, dz_m)
     vector["air_pressure_lower"] = air_pressure_lower
     level_lower = air_pressure_lower / 100.0
 
-    models.interpolate_met(
-        met,
-        vector,
-        "eastward_wind",
-        "u_wind_lower",
+    # Lower layer (same longitude/latitude/time, shifted level): co-located.
+    store_group(
+        [
+            ("eastward_wind", "u_wind_lower"),
+            ("northward_wind", "v_wind_lower"),
+            ("air_temperature", "air_temperature_lower"),
+        ],
         level=level_lower,
-        **interp_kwargs,
-    )
-    models.interpolate_met(
-        met,
-        vector,
-        "northward_wind",
-        "v_wind_lower",
-        level=level_lower,
-        **interp_kwargs,
-    )
-    models.interpolate_met(
-        met,
-        vector,
-        "air_temperature",
-        "air_temperature_lower",
-        level=level_lower,
-        **interp_kwargs,
     )
 
     lons = vector["longitude"]
@@ -455,28 +498,17 @@ def _perform_interp_for_step(
     vector["longitude_tail"] = longitude_tail
     vector["latitude_tail"] = latitude_tail
 
-    for met_key in ("eastward_wind", "northward_wind"):
-        vector_key = f"{met_key}_head"
-        models.interpolate_met(
-            met,
-            vector,
-            met_key,
-            vector_key,
-            **interp_kwargs,
-            longitude=longitude_head,
-            latitude=latitude_head,
-        )
-
-        vector_key = f"{met_key}_tail"
-        models.interpolate_met(
-            met,
-            vector,
-            met_key,
-            vector_key,
-            **interp_kwargs,
-            longitude=longitude_tail,
-            latitude=latitude_tail,
-        )
+    # Plume head and tail points: eastward/northward wind, each pair co-located.
+    store_group(
+        [("eastward_wind", "eastward_wind_head"), ("northward_wind", "northward_wind_head")],
+        longitude=longitude_head,
+        latitude=latitude_head,
+    )
+    store_group(
+        [("eastward_wind", "eastward_wind_tail"), ("northward_wind", "northward_wind_tail")],
+        longitude=longitude_tail,
+        latitude=latitude_tail,
+    )
 
 
 def _calc_geometry(
@@ -694,25 +726,11 @@ def _advect_centerline_rk4(
         dlev = (w + extra_dp_dt) / 100.0
         return dlon, dlat, dlev
 
-    # Index reuse (below) is only supported with localize=False (the default).
-    share_indices = not interp_kwargs.get("localize", False)
-
     def interp(
         lon: np.ndarray, lat: np.ndarray, lev: np.ndarray, time: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if not share_indices:
-            return (
-                u_mda.interpolate(lon, lat, lev, time, **interp_kwargs),
-                v_mda.interpolate(lon, lat, lev, time, **interp_kwargs),
-                w_mda.interpolate(lon, lat, lev, time, **interp_kwargs),
-            )
-        # u, v and omega share the met grid and are sampled at the same 4-D point, so
-        # the grid-index search (``_find_indices``, the dominant interpolation cost) is
-        # done once and reused for the other two. This is bit-identical to
-        # interpolating each variable independently.
-        u, idx = u_mda.interpolate(lon, lat, lev, time, return_indices=True, **interp_kwargs)
-        v = v_mda.interpolate(lon, lat, lev, time, indices=idx, **interp_kwargs)
-        w = w_mda.interpolate(lon, lat, lev, time, indices=idx, **interp_kwargs)
+        # u, v and omega are co-located; share the grid-index search across them.
+        u, v, w = _interp_colocated([u_mda, v_mda, w_mda], lon, lat, lev, time, **interp_kwargs)
         return u, v, w
 
     # Stage 1 reuses the once-per-step interpolation already attached to ``vector``.
