@@ -428,3 +428,53 @@ def test_dry_advection_sedimentation_density_aware() -> None:
     # 200 hPa parcel for the same fall speed -- a fixed Pa/s rate would give 1.0.
     ratio = one_step_drop(300.0, v_fall) / one_step_drop(200.0, v_fall)
     assert ratio == pytest.approx(1.5, rel=1e-3)
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_dry_advection_parallel_matches_serial(met_cocip1: MetDataset) -> None:
+    """Parallel fleet processing is identical to serial across all the modeling.
+
+    The parallel path (joblib) splits flights into chunks processed in separate
+    worker processes. Advection is per-waypoint, so the combined result must match a
+    single-Fleet serial run -- including wind-shear geometry, downwash and
+    sedimentation. This is the only coverage of the parallel code path.
+    """
+    pytest.importorskip("joblib")
+    from pycontrails.core.fleet import Fleet
+
+    t0 = pd.Timestamp(met_cocip1.data["time"].values[0])
+    flights = []
+    for i, (lon0, lat0) in enumerate([(-32.0, 53.0), (-30.0, 54.0), (-28.0, 52.0), (-34.0, 55.0)]):
+        df = pd.DataFrame(
+            {
+                "longitude": np.linspace(lon0, lon0 + 0.5, 10),
+                "latitude": np.linspace(lat0, lat0 + 0.3, 10),
+                "altitude": np.full(10, 11000.0),
+                "time": pd.date_range(t0, t0 + pd.Timedelta("9min"), periods=10),
+            }
+        )
+        fl = Flight(df, attrs={"flight_id": f"f{i}"})
+        fl["azimuth"] = fl.segment_azimuth()
+        flights.append(fl)
+
+    params = {
+        "max_age": np.timedelta64(30, "m"),
+        "dt_integration": np.timedelta64(10, "m"),
+        "apply_downwash": True,
+        "sedimentation_velocity": 0.1,
+    }
+
+    serial = DryAdvection(met_cocip1, params).eval(Fleet.from_seq([f.copy() for f in flights]))
+    parallel = DryAdvection(met_cocip1, {**params, "parallel": True, "n_jobs": 2}).eval(
+        [f.copy() for f in flights]
+    )
+
+    key = ["flight_id", "waypoint", "time"]
+    df_s = serial.dataframe.sort_values(key).reset_index(drop=True)
+    df_p = pd.concat([f.dataframe for f in parallel]).sort_values(key).reset_index(drop=True)
+
+    assert len(df_p) == len(df_s)
+    for col in ("longitude", "latitude", "level", "width", "depth"):
+        np.testing.assert_allclose(
+            df_p[col].to_numpy(), df_s[col].to_numpy(), rtol=1e-9, atol=1e-9, equal_nan=True
+        )
