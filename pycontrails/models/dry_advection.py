@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import sys
-from collections.abc import Sequence
 from typing import Any, NoReturn, overload
 
 if sys.version_info >= (3, 12):
@@ -17,8 +16,6 @@ import numpy.typing as npt
 import pandas as pd
 
 from pycontrails.core import models
-from pycontrails.core.fleet import Fleet
-from pycontrails.core.flight import Flight
 from pycontrails.core.met import MetDataArray, MetDataset, maybe_downselect_mds
 from pycontrails.core.met_var import (
     AirTemperature,
@@ -157,36 +154,29 @@ class DryAdvection(models.Model):
     def eval(self, source: GeoVectorDataset, **params: Any) -> GeoVectorDataset: ...
 
     @overload
-    def eval(self, source: Sequence[Flight], **params: Any) -> list[Flight]: ...
-
-    @overload
     def eval(self, source: None = ..., **params: Any) -> NoReturn: ...
 
-    def eval(
-        self, source: GeoVectorDataset | Sequence[Flight] | None = None, **params: Any
-    ) -> GeoVectorDataset | list[Flight]:
+    def eval(self, source: GeoVectorDataset | None = None, **params: Any) -> GeoVectorDataset:
         """Simulate dry advection of arbitrary points.
 
         Like :class:`Cocip`, this model adds a "waypoint" column to the :attr:`source`.
 
         Parameters
         ----------
-        source : GeoVectorDataset | Sequence[Flight] | None
+        source : GeoVectorDataset | None
             Arbitrary points to advect. A :class:`Flight` instance is not treated any
             differently than a :class:`GeoVectorDataset`. In particular, the user must
             explicitly set ``flight["azimuth"] = flight.segment_azimuth()`` if they
             want to use wind shear effects for a flight.
             In the current implementation, any existing meteorological variables in the ``source``
             are ignored. The ``source`` will be interpolated against the :attr:`met` dataset.
-            If a Sequence[Flight] is provided and parallel=True, flights will be processed
-            in parallel.
         **params : Any
             Overwrite model parameters defined in ``__init__``.
 
         Returns
         -------
-        GeoVectorDataset | list[Flight]
-            Advected points. If source is Sequence[Flight] and parallel=True, returns list[Flight].
+        GeoVectorDataset
+            Advected points.
         """
         self.update_params(params)
 
@@ -195,19 +185,6 @@ class DryAdvection(models.Model):
         if max_age is None and timesteps is None:
             msg = "Timesteps must be set using the timesteps parameter when max_age is None"
             raise ValueError(msg)
-
-        # Handle parallel processing EARLY if enabled
-        # We need to downselect met based on all flights, then spawn workers
-        if self.params.get("parallel", False) and isinstance(source, Sequence):
-            # Convert to Fleet temporarily to get bounds for downselection
-            temp_fleet = Fleet.from_seq(source)
-            self.source = temp_fleet
-
-            # Downselect met to region covering all flights
-            self.downselect_met()
-
-            # Now do parallel processing with downselected met
-            return self.eval_parallel(list(source), **params)
 
         self.set_source(source)
         self.source = self.require_source_type(GeoVectorDataset)

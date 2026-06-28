@@ -7,8 +7,6 @@ import functools
 import hashlib
 import json
 import logging
-import os
-import tempfile
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -34,110 +32,6 @@ if TYPE_CHECKING:
     import scipy.interpolate
 
 logger = logging.getLogger(__name__)
-
-
-def _load_met_from_path(met_path: str) -> MetDataset:
-    """Load MetDataset from a joblib file with memory mapping.
-
-    Parameters
-    ----------
-    met_path : str
-        Path to joblib file containing met data
-
-    Returns
-    -------
-    MetDataset
-        Reconstructed MetDataset with memory-mapped arrays
-    """
-    from joblib import load
-    import xarray as xr
-
-    # Load with memory mapping - arrays will be np.memmap
-    met_dict = load(met_path, mmap_mode='r')
-
-    # Reconstruct xarray Dataset from memory-mapped arrays
-    # First build coordinates with proper dimensions
-    coords_dict = {}
-    for coord_name, coord_info in met_dict['coords'].items():
-        if isinstance(coord_info, dict):
-            # Coordinate with dims/attrs info
-            coords_dict[coord_name] = (coord_info['dims'], coord_info['data'], coord_info.get('attrs', {}))
-        else:
-            # Simple 1D coordinate (legacy format or simple coords)
-            coords_dict[coord_name] = coord_info
-
-    data_vars_dict = {}
-    for var_name, var_data in met_dict['data_vars'].items():
-        arr = var_data['data']
-        data_vars_dict[var_name] = (var_data['dims'], arr, var_data['attrs'])
-
-    # Create xarray Dataset with memory-mapped arrays
-    ds = xr.Dataset(data_vars_dict, coords=coords_dict, attrs=met_dict['attrs'])
-    return MetDataset(ds)
-
-
-def _eval_chunk_with_met_path(
-    model_class: type,
-    met_path: str | None,
-    chunk: list[Flight],
-    model_params: dict[str, Any],
-    eval_params: dict[str, Any],
-    rad_path: str | None = None,
-) -> GeoVectorDataset:
-    """Worker function to evaluate a chunk of flights with met data loaded from file.
-
-    This function is called by parallel workers. It loads met data from a file path
-    instead of receiving a pickled copy, which saves memory.
-
-    Parameters
-    ----------
-    model_class : type
-        Model class to instantiate
-    met_path : str | None
-        Path to joblib file containing met data
-    chunk : list[Flight]
-        Chunk of flights to process
-    model_params : dict[str, Any]
-        Model parameters
-    eval_params : dict[str, Any]
-        Parameters to pass to eval()
-    rad_path : str | None
-        Path to joblib file containing radiation data (for CoCiP)
-
-    Returns
-    -------
-    GeoVectorDataset
-        Evaluated result for the chunk (may be Fleet or plain GeoVectorDataset)
-    """
-    # Load met data from joblib file with memory mapping
-    met = None
-    if met_path is not None:
-        met = _load_met_from_path(met_path)
-
-    # Load rad data if provided (for CoCiP)
-    rad = None
-    if rad_path is not None:
-        rad = _load_met_from_path(rad_path)
-
-    # Create model instance with loaded met data
-    # Disable parallel to avoid nested parallelism
-    params_copy = model_params.copy()
-    params_copy["parallel"] = False
-    params_copy["downselect_met"] = False  # Met already downselected by parent
-
-    # Handle models that require rad (like CoCiP)
-    if rad is not None:
-        model = model_class(met=met, rad=rad, params=params_copy)
-    else:
-        model = model_class(met=met, params=params_copy)
-
-    # Convert chunk to Fleet and evaluate
-    # This allows all flights in chunk to evolve together through timesteps
-    fleet = Fleet.from_seq(chunk)
-    result = model.eval(fleet, **eval_params)
-
-    return result  # type: ignore[return-value]
-
 
 #: Model input source types
 ModelInput = MetDataset | GeoVectorDataset | Flight | Sequence[Flight] | None
@@ -229,28 +123,6 @@ class ModelParams:
         np.timedelta64(0, "h"),
         np.timedelta64(0, "h"),
     )
-
-    # ---------------
-    # Parallel processing
-    # ---------------
-
-    #: Enable parallel processing when source is a Sequence[Flight].
-    #: If True, flights will be split into chunks and processed in parallel.
-    #: Each chunk is converted to a Fleet to minimize memory usage per worker.
-    #: .. versionadded:: 0.54.12
-    parallel: bool = False
-
-    #: Number of parallel workers to use. If -1, use all available CPU cores.
-    #: Only applies when :attr:`parallel` is True.
-    #: .. versionadded:: 0.54.12
-    n_jobs: int = -1
-
-    #: Number of flights per chunk for parallel processing.
-    #: If None, flights are split evenly across workers.
-    #: Smaller chunks reduce memory per worker but increase overhead.
-    #: Only applies when :attr:`parallel` is True.
-    #: .. versionadded:: 0.54.12
-    parallel_chunk_size: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Convert object to dictionary.
@@ -615,9 +487,9 @@ class Model(ABC):
     def _get_source(self, source: GeoVectorDataset) -> GeoVectorDataset: ...
 
     @overload
-    def _get_source(self, source: Sequence[Flight]) -> Fleet | list[Flight]: ...
+    def _get_source(self, source: Sequence[Flight]) -> Fleet: ...
 
-    def _get_source(self, source: ModelInput) -> SourceType | list[Flight]:
+    def _get_source(self, source: ModelInput) -> SourceType:
         """Construct :attr:`source` from ``source`` parameter."""
 
         # Fallback to met coordinates if source is None
@@ -629,16 +501,11 @@ class Model(ABC):
 
         copy_source = self.params["copy_source"]
 
-        # Turn Sequence into Fleet (or keep as list for parallel processing)
+        # Turn Sequence into Fleet
         if isinstance(source, Sequence):
             if not copy_source:
                 msg = "Parameter copy_source=False is not supported for Sequence[Flight] source"
                 raise ValueError(msg)
-
-            # If parallel processing is enabled, keep as list for chunking
-            if self.params.get("parallel", False):
-                return list(source)
-
             return Fleet.from_seq(source)
 
         # Raise error if source is not a MetDataset or GeoVectorDataset
@@ -666,279 +533,6 @@ class Model(ABC):
                 source["flight_id"] = np.zeros(len(source), dtype=int)
 
         return source
-
-    def _split_flights_into_chunks(
-        self, flights: Sequence[Flight]
-    ) -> list[list[Flight]]:
-        """Split flights into chunks for parallel processing.
-
-        Parameters
-        ----------
-        flights : Sequence[Flight]
-            List of flights to split
-
-        Returns
-        -------
-        list[list[Flight]]
-            List of flight chunks
-        """
-        n_flights = len(flights)
-        chunk_size = self.params["parallel_chunk_size"]
-        n_jobs = self.params["n_jobs"]
-
-        if chunk_size is not None:
-            # Split by chunk size
-            chunks = [
-                list(flights[i : i + chunk_size])
-                for i in range(0, n_flights, chunk_size)
-            ]
-        else:
-            # Split evenly across workers
-            import os
-            if n_jobs == -1:
-                n_jobs = os.cpu_count() or 1
-
-            chunk_size = max(1, n_flights // n_jobs)
-            chunks = [
-                list(flights[i : i + chunk_size])
-                for i in range(0, n_flights, chunk_size)
-            ]
-
-        return chunks
-
-    def _eval_chunk(
-        self, chunk: list[Flight], **params: Any
-    ) -> GeoVectorDataset:
-        """Evaluate a chunk of flights.
-
-        This method is called by parallel workers. It converts the chunk
-        to a Fleet and calls eval.
-
-        Parameters
-        ----------
-        chunk : list[Flight]
-            Chunk of flights to process
-        **params : Any
-            Model parameters
-
-        Returns
-        -------
-        GeoVectorDataset
-            Evaluated result as GeoVectorDataset (may be Fleet or plain GeoVectorDataset)
-        """
-        # Convert chunk to Fleet
-        fleet = Fleet.from_seq(chunk)
-        # Temporarily disable parallel to avoid nested parallelism
-        original_parallel = self.params.get("parallel", False)
-        self.params["parallel"] = False
-        try:
-            result = self.eval(fleet, **params)
-        finally:
-            self.params["parallel"] = original_parallel
-
-        # If result is already a GeoVectorDataset (not Fleet), return as-is
-        # The caller will handle conversion back to flights
-        return result  # type: ignore[return-value]
-
-    def _save_met_to_temp_file(
-        self,
-        met_data: MetDataset,
-        label: str,
-    ) -> tuple[str, bool]:
-        """Save MetDataset to a temporary file for parallel processing.
-
-        Parameters
-        ----------
-        met_data : MetDataset
-            The met or rad dataset to save
-        label : str
-            Label for logging (e.g., "met" or "rad")
-
-        Returns
-        -------
-        tuple[str, bool]
-            Tuple of (file_path, temp_file_created)
-        """
-        from joblib import dump
-
-        # Extract all data as numpy arrays for memory mapping
-        # Store metadata separately to reconstruct MetDataset in workers
-        met_dict = {
-            'coords': {},
-            'data_vars': {},
-            'attrs': dict(met_data.attrs),
-        }
-
-        # Extract coordinates with their dims and attrs
-        for coord_name, coord_data in met_data.data.coords.items():
-            met_dict['coords'][coord_name] = {
-                'data': np.asarray(coord_data.values),
-                'dims': coord_data.dims,
-                'attrs': dict(coord_data.attrs),
-            }
-
-        # Extract data variables as numpy arrays (forcing load of lazy arrays)
-        # Save all variables - filtering by standard_name is unreliable due to
-        # provider-specific variants (e.g., ciwc vs cli for cloud ice)
-        for var_name in met_data.data.data_vars:
-            da = met_data.data[var_name]
-
-            # Force load if lazy (dask)
-            if hasattr(da.data, 'compute'):
-                arr = da.data.compute()
-            else:
-                arr = da.values
-            met_dict['data_vars'][var_name] = {
-                'data': np.asarray(arr),
-                'dims': da.dims,
-                'attrs': dict(da.attrs),
-            }
-
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(suffix='.joblib', delete=False) as f:
-            file_path = f.name
-
-        # Save extracted arrays - joblib will memmap these numpy arrays
-        dump(met_dict, file_path, compress=0)
-
-        file_size_mb = os.path.getsize(file_path) / 1e6
-        logger.info(f"{label.capitalize()} data saved to temp file ({file_size_mb:.1f} MB)")
-
-        return file_path, True
-
-    def eval_parallel(
-        self, flights: list[Flight], **params: Any
-    ) -> list[Flight]:
-        """Evaluate flights in parallel using chunked Fleet processing.
-
-        This method splits flights into chunks, processes each chunk as a Fleet
-        in parallel, and returns the combined results.
-
-        To avoid memory duplication, the met dataset is saved to a temporary file
-        and workers load it from there instead of receiving a pickled copy.
-
-        Parameters
-        ----------
-        flights : list[Flight]
-            List of flights to process
-        **params : Any
-            Model parameters
-
-        Returns
-        -------
-        list[Flight]
-            List of processed flights
-
-        Raises
-        ------
-        ImportError
-            If joblib is not installed
-        """
-        try:
-            from joblib import Parallel, delayed
-        except ImportError as e:
-            msg = (
-                "joblib is required for parallel processing. "
-                "Install it with: pip install joblib"
-            )
-            raise ImportError(msg) from e
-
-        # Split flights into chunks
-        chunks = self._split_flights_into_chunks(flights)
-
-        # Extract numpy arrays from MetDataset and save for memory mapping
-        # joblib can only memmap top-level arrays, not nested xarray structures
-        met_path = None
-        rad_path = None
-        met_temp_created = False
-        rad_temp_created = False
-
-        if self.met is not None:
-            logger.info("Preparing met data for parallel processing")
-            met_path, met_temp_created = self._save_met_to_temp_file(self.met, "met")
-
-        # Handle rad data for models like CoCiP
-        if hasattr(self, 'rad') and self.rad is not None:
-            logger.info("Preparing rad data for parallel processing")
-            rad_path, rad_temp_created = self._save_met_to_temp_file(self.rad, "rad")
-
-        try:
-            # Process chunks in parallel
-            # Pass met_path instead of self to avoid pickling self.met
-            n_jobs = self.params["n_jobs"]
-            model_class = type(self)
-            model_params = self.params.copy()
-
-            # Use 'loky' backend with max_nbytes=1M to force memmapping of large objects
-            # This prevents copying the met data to each worker
-            # CRITICAL: Use prefer="processes" to force fresh process pool (not threads)
-            results = Parallel(
-                n_jobs=n_jobs,
-                backend='loky',
-                max_nbytes='1M',  # Memmap anything larger than 1MB
-                prefer="processes"
-            )(
-                delayed(_eval_chunk_with_met_path)(
-                    model_class, met_path, chunk, model_params, params, rad_path
-                ) for chunk in chunks
-            )
-        finally:
-            # Clean up temporary files
-            if met_temp_created and met_path is not None and os.path.exists(met_path):
-                logger.info(f"Removing temporary met file: {met_path}")
-                os.unlink(met_path)
-            if rad_temp_created and rad_path is not None and os.path.exists(rad_path):
-                logger.info(f"Removing temporary rad file: {rad_path}")
-                os.unlink(rad_path)
-
-            # Clean up loky executor to prevent resource leaks
-            # This MUST happen after file cleanup to ensure workers have released file handles
-            # Critical for preventing semlock/folder leaks in batch processing scenarios
-            try:
-                import gc
-                from joblib.externals.loky import reusable_executor
-
-                # Access the global executor state directly and shut it down
-                # This is the actual executor used by Parallel()
-                with reusable_executor._executor_lock:
-                    if reusable_executor._executor is not None:
-                        try:
-                            # Graceful shutdown (not kill_workers to avoid corruption)
-                            reusable_executor._executor.shutdown(wait=True)
-                        except Exception as e:
-                            logger.debug(f"Error during executor shutdown: {e}")
-                        finally:
-                            # Clear the global executor reference to force fresh executor next time
-                            reusable_executor._executor = None
-                            reusable_executor._executor_kwargs = None
-
-                # Force garbage collection to clean up any lingering references
-                gc.collect()
-            except Exception as e:
-                # Log but don't raise to avoid masking other exceptions
-                logger.debug(f"Error during executor cleanup: {e}")
-
-        # Flatten results back to list of flights
-        output_flights = []
-        for result in results:
-            # Handle both Fleet (which has to_flight_list) and plain GeoVectorDataset
-            if hasattr(result, 'to_flight_list'):
-                # Result is a Fleet
-                output_flights.extend(result.to_flight_list())
-            elif isinstance(result, GeoVectorDataset) and 'flight_id' in result:
-                # Result is a GeoVectorDataset with flight_id - convert back to flights
-                flight_ids = np.unique(result['flight_id'])
-                for fid in flight_ids:
-                    mask = result['flight_id'] == fid
-                    flight_data = result.filter(mask)
-                    # Convert to Flight
-                    flight = Flight(flight_data.data)
-                    output_flights.append(flight)
-            else:
-                msg = f"Unexpected result type from _eval_chunk: {type(result)}"
-                raise TypeError(msg)
-
-        return output_flights
 
     def set_source(self, source: ModelInput = None) -> None:
         """Attach original or copy of input ``source`` to :attr:`source`.
