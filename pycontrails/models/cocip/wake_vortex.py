@@ -406,3 +406,124 @@ def initial_contrail_depth(
         Initial contrail depth, [:math:`m`]
     """
     return dz_max * initial_wake_vortex_depth
+
+
+def downward_displacement_profile(
+    time_since_formation: npt.NDArray[np.floating],
+    wingspan: npt.NDArray[np.floating] | float,
+    true_airspeed: npt.NDArray[np.floating],
+    aircraft_mass: npt.NDArray[np.floating] | float,
+    air_temperature: npt.NDArray[np.floating],
+    dT_dz: npt.NDArray[np.floating],
+    ds_dz: npt.NDArray[np.floating],
+    air_pressure: npt.NDArray[np.floating],
+    effective_vertical_resolution: float,
+    wind_shear_enhancement_exponent: npt.NDArray[np.floating] | float,
+    turbulent_vertical_velocity_scale: npt.NDArray[np.floating] | float,
+    *,
+    displacement_fraction: float = 0.25,
+) -> npt.NDArray[np.floating]:
+    r"""Time-resolved downward displacement of the contrail centroid during the wake phase.
+
+    :func:`max_downward_displacement` returns only the end-state maximum sinking
+    :math:`\Delta z_w`; :cite:`schumannContrailCirrusPrediction2012` explicitly "do[es]
+    not resolve the details of the jet and wake dynamics in the first minutes". This
+    function resolves the centroid descent over time so the early, fast-moving wake
+    phase can be sampled (e.g. at 5 s) for geometry-grade traces.
+
+    The descent is built from the same anchors CoCiP already uses:
+
+    - initial velocity scale :math:`w_0 = b_0 / t_0` (with :math:`b_0` the vortex
+      separation and :math:`t_0` the :func:`effective_time_scale`),
+    - maximum sinking :math:`\Delta z_w` (:func:`max_downward_displacement`),
+    - the time of maximum sinking, which :cite:`schumannContrailCirrusPrediction2012`
+      (p. 548, after :cite:`holzapfelProbabilisticTwoPhaseWake2003`) places at
+      :math:`5 t_0` (strongly stratified) to :math:`12 t_0` (weakly stratified). This is
+      interpolated on the regime parameter :math:`N_{BV} t_0` (the same 0.8 threshold
+      used for :math:`\Delta z_w`).
+
+    The vortex-core descent is the decelerating curve
+
+    .. math::
+
+        z_v(t) = \Delta z_w \left[1 - (1 - t/t_\mathrm{max})^p\right], \quad
+        p = \frac{w_0 \, t_\mathrm{max}}{\Delta z_w},
+
+    which honours :math:`\dot z_v(0) = w_0`, :math:`z_v(t_\mathrm{max}) = \Delta z_w`, and
+    :math:`\dot z_v(t_\mathrm{max}) = 0` (smooth landing); ``p`` is clipped to
+    :math:`\geq 1` so the descent is always monotone-decelerating. The contrail
+    **centroid** is placed at ``displacement_fraction`` of the vortex-core sinking
+    (:math:`C_{z1} = 0.25`, Eq. 13 of :cite:`schumannContrailCirrusPrediction2012` — the
+    value CoCiP uses for the post-wake contrail altitude).
+
+    .. note::
+
+        The endpoints (:math:`w_0`, :math:`\Delta z_w`, :math:`t_\mathrm{max}`) and the
+        :math:`0.25` centroid fraction are from the literature. The interpolating *shape*
+        between them is a closure: the wake phase is intrinsically probabilistic and the
+        cited models give the end-state, not the trajectory. Treat the transient shape as
+        model-dependent (validatable only at its endpoints without observations).
+
+    Parameters
+    ----------
+    time_since_formation : npt.NDArray[np.floating]
+        Times since contrail formation at which to evaluate the descent, [:math:`s`].
+        1-D array of length ``n_times``.
+    wingspan, true_airspeed, aircraft_mass, air_temperature, dT_dz, ds_dz, air_pressure :
+        Per-waypoint quantities, exactly as passed to :func:`max_downward_displacement`.
+        Array-valued quantities have length ``n_waypoints``.
+    effective_vertical_resolution : float
+        Passed through to :func:`max_downward_displacement`.
+    wind_shear_enhancement_exponent, turbulent_vertical_velocity_scale :
+        Passed through to :func:`max_downward_displacement`.
+    displacement_fraction : float
+        Fraction of the vortex-core sinking at which the contrail centroid settles.
+        Defaults to ``0.25`` (:math:`C_{z1}`, Eq. 13).
+
+    Returns
+    -------
+    npt.NDArray[np.floating]
+        Downward displacement of the contrail centroid, shape
+        ``(n_waypoints, n_times)``, [:math:`m`]. Positive is downward.
+
+    References
+    ----------
+    - :cite:`schumannContrailCirrusPrediction2012`
+    - :cite:`holzapfelProbabilisticTwoPhaseWake2003`
+    """
+    rho_air = thermo.rho_d(air_temperature, air_pressure)
+    n_bv = thermo.brunt_vaisala_frequency(air_pressure, air_temperature, dT_dz)
+    t_0 = effective_time_scale(wingspan, true_airspeed, aircraft_mass, rho_air)
+    b_0 = wake_vortex_separation(wingspan)
+    w_0 = b_0 / t_0  # w_0 = Γ_0 / (2π b_0) = b_0 / t_0
+    dz_max = max_downward_displacement(
+        wingspan,
+        true_airspeed,
+        aircraft_mass,
+        air_temperature,
+        dT_dz,
+        ds_dz,
+        air_pressure,
+        effective_vertical_resolution=effective_vertical_resolution,
+        wind_shear_enhancement_exponent=wind_shear_enhancement_exponent,
+        turbulent_vertical_velocity_scale=turbulent_vertical_velocity_scale,
+    )
+
+    # Per-waypoint anchors as 1-D arrays (n_waypoints,).
+    dz_max = np.atleast_1d(np.asarray(dz_max, dtype=float))
+    t_0 = np.broadcast_to(np.atleast_1d(np.asarray(t_0, dtype=float)), dz_max.shape)
+    w_0 = np.broadcast_to(np.atleast_1d(np.asarray(w_0, dtype=float)), dz_max.shape)
+    n_bv = np.broadcast_to(np.atleast_1d(np.asarray(n_bv, dtype=float)), dz_max.shape)
+
+    # Time of maximum sinking: 12*t_0 (weakly) -> 5*t_0 (strongly stratified).
+    regime = np.clip(n_bv * t_0 / 0.8, 0.0, 1.0)  # 0 weak, 1 strong
+    t_max = t_0 * (12.0 - 7.0 * regime)
+
+    # Decelerating shape exponent; clip to >= 1 to keep the descent monotone-decelerating.
+    p = np.maximum(w_0 * t_max / dz_max, 1.0)
+
+    t = np.atleast_1d(np.asarray(time_since_formation, dtype=float))  # (n_times,)
+    tau = np.minimum(t[None, :], t_max[:, None]) / t_max[:, None]  # (n_waypoints, n_times)
+    z_vortex = dz_max[:, None] * (1.0 - (1.0 - tau) ** p[:, None])
+
+    return displacement_fraction * z_vortex
