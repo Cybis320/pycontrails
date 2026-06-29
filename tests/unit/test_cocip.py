@@ -725,13 +725,16 @@ def test_flight_overrides(fl: Flight, met: MetDataset, rad: MetDataset) -> None:
     assert np.all(out2["true_airspeed"] == 40)
     assert np.all(out2["air_temperature"] == 220)
 
-    # AND, these variables do impact the model output!
+    # AND, these variables do impact the model output! Waypoints 14 and 18 are marginal:
+    # the overrides (and the RK4-advected path) tip them from non-persistent to persistent.
     assert out1["cocip"][18] == 0
     assert out2["cocip"][18] == 1
+    assert out1["cocip"][14] == 0
+    assert out2["cocip"][14] == 1
 
     # The rest are equal
     filt = np.ones(len(out1), dtype=bool)
-    filt[18] = False
+    filt[[14, 18]] = False
     np.testing.assert_array_equal(out1["cocip"][filt], out2["cocip"][filt])
 
     # Test "waypoint" data provided with flight
@@ -1199,9 +1202,9 @@ def test_cocip_contrail_contrail_overlapping(
     out = cocip.eval(fleet)
 
     if contrail_contrail_overlapping:
-        assert out["ef"].sum() == pytest.approx(624427.4e8, abs=8e7)
+        assert out["ef"].sum() == pytest.approx(643722.6e8, abs=8e7)
     else:
-        assert out["ef"].sum() == pytest.approx(624429.4e8, abs=8e7)
+        assert out["ef"].sum() == pytest.approx(643725.0e8, abs=8e7)
 
 
 # ------

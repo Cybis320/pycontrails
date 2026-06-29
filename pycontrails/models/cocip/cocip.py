@@ -27,6 +27,7 @@ from pycontrails.core.models import Model, interpolate_met
 from pycontrails.core.vector import GeoVectorDataset, VectorDataDict
 from pycontrails.datalib import ecmwf, gfs
 from pycontrails.models import extended_k15, sac, tau_cirrus
+from pycontrails.models._advection import advect_centerline_rk4
 from pycontrails.models.cocip import (
     contrail_properties,
     radiative_forcing,
@@ -2539,11 +2540,8 @@ def calc_timestep_contrail_evolution(
     # get required met values for evolution calculations
     q_sat_1 = contrail_1["q_sat"]
     rho_air_1 = contrail_1["rho_air"]
-    u_wind_1 = contrail_1["u_wind"]
-    v_wind_1 = contrail_1["v_wind"]
 
     specific_humidity_1 = contrail_1["specific_humidity"]
-    vertical_velocity_1 = contrail_1["vertical_velocity"]
     iwc_1 = contrail_1["iwc"]
 
     # get required contrail_1 properties
@@ -2567,9 +2565,16 @@ def calc_timestep_contrail_evolution(
     time_2_array = np.full_like(time_1, time_2)
     dt = time_2_array - time_1
 
-    # get new contrail location & segment properties after t_step
-    longitude_2, latitude_2 = geo.advect_horizontal(longitude_1, latitude_1, u_wind_1, v_wind_1, dt)
-    level_2 = geo.advect_level(level_1, vertical_velocity_1, rho_air_1, terminal_fall_speed_1, dt)
+    # get new contrail location after t_step. Integrate the centerline with classical
+    # RK4 (re-interpolating u/v/omega from met at each of the four stages) rather than
+    # freezing the start-of-step wind (forward Euler), which accrued kilometre-scale
+    # error over 1-3 h in curving flow. The sedimentation pressure tendency
+    # ``rho_air * terminal_fall_speed * g`` is held constant across the step, exactly as
+    # the prior ``advect_level`` did (it is a slowly varying microphysical property).
+    extra_dp_dt = rho_air_1 * terminal_fall_speed_1 * constants.g
+    longitude_2, latitude_2, level_2 = advect_centerline_rk4(
+        met, contrail_1, time_2, extra_dp_dt=extra_dp_dt, **interp_kwargs
+    )
     altitude_2 = units.pl_to_m(level_2)
 
     contrail_2 = GeoVectorDataset._from_fastpath(
