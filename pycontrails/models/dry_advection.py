@@ -55,6 +55,15 @@ class DryAdvectionParams(models.AdvectionBuffers):
     #: (no sedimentation).
     sedimentation_velocity: float = 0.0
 
+    #: Use a CoCiP-like *microphysical* sedimentation fall speed instead of the constant
+    #: :attr:`sedimentation_velocity`. When ``True``, the mean ice-crystal radius grows with
+    #: contrail age via :func:`contrail_properties.emulated_crystal_radius` (a surrogate for
+    #: CoCiP's Fig. 7 growth, valid in ice-supersaturated air) and the terminal fall speed
+    #: follows :func:`contrail_properties.ice_particle_terminal_fall_speed` -- so the descent
+    #: *curves* like CoCiP's rather than being linear. This is applied unconditionally (every
+    #: flight, no SAC / persistence gate). Overrides :attr:`sedimentation_velocity` when set.
+    microphysical_sedimentation: bool = False
+
     #: Difference in altitude between top and bottom layer for stratification calculations,
     #: [:math:`m`]. Used to approximate derivative of "lagrangian_tendency_of_air_pressure"
     #: (upward component of air velocity) with respect to altitude.
@@ -199,6 +208,7 @@ class DryAdvection(models.Model):
         interp_kwargs = self.interp_kwargs
 
         sedimentation_velocity = self.params["sedimentation_velocity"]
+        microphysical_sedimentation = self.params["microphysical_sedimentation"]
         dz_m = self.params["dz_m"]
         max_depth = self.params["max_depth"]
         verbose_outputs = self.params["verbose_outputs"]
@@ -246,6 +256,7 @@ class DryAdvection(models.Model):
                 vector1,
                 t,
                 sedimentation_velocity=sedimentation_velocity,
+                microphysical_sedimentation=microphysical_sedimentation,
                 dz_m=dz_m,
                 max_depth=max_depth,
                 verbose_outputs=verbose_outputs,
@@ -582,6 +593,7 @@ def _evolve_one_step(
     t: np.datetime64,
     *,
     sedimentation_velocity: float,
+    microphysical_sedimentation: bool = False,
     dz_m: float,
     max_depth: float | None,
     verbose_outputs: bool,
@@ -595,7 +607,7 @@ def _evolve_one_step(
 
     # Both downwash and sedimentation need air density (rho = p / (R_d T)), so they
     # require an interpolated air temperature even in pointwise mode.
-    sedimentation_enabled = sedimentation_velocity != 0.0
+    sedimentation_enabled = sedimentation_velocity != 0.0 or microphysical_sedimentation
     downwash_enabled = downwash_distance is not None
     need_air_temperature = sedimentation_enabled or downwash_enabled
     _perform_interp_for_step(
@@ -607,7 +619,20 @@ def _evolve_one_step(
     extra_dp_dt: npt.NDArray[np.floating] | float = 0.0
     if sedimentation_enabled:
         rho_air = vector["air_pressure"] / (constants.R_d * vector["air_temperature"])
-        extra_dp_dt = rho_air * constants.g * sedimentation_velocity
+        if microphysical_sedimentation:
+            # CoCiP-like fall speed: the mean crystal radius grows with contrail age, then
+            # the Spichtinger terminal velocity -- a *curving* descent, applied
+            # unconditionally (no SAC/persistence gate). See emulated_crystal_radius.
+            age_s = vector["age"] / np.timedelta64(1, "s")
+            r_ice = contrail_properties.emulated_crystal_radius(age_s)
+            v_sed: npt.NDArray[np.floating] | float = (
+                contrail_properties.ice_particle_terminal_fall_speed(
+                    vector["air_pressure"], vector["air_temperature"], r_ice
+                )
+            )
+        else:
+            v_sed = sedimentation_velocity
+        extra_dp_dt = rho_air * constants.g * v_sed
 
     dt = t - vector["time"]
     # Integrate the centerline with classical RK4 (re-interpolating the wind at each

@@ -10,6 +10,7 @@ import xarray as xr
 
 from pycontrails import Flight, GeoVectorDataset, MetDataset
 from pycontrails.models.cocip import Cocip
+from pycontrails.models.cocip.contrail_properties import emulated_crystal_radius
 from pycontrails.models.dry_advection import DryAdvection
 from pycontrails.models.humidity_scaling import ConstantHumidityScaling
 from pycontrails.physics import geo
@@ -428,3 +429,58 @@ def test_dry_advection_sedimentation_density_aware() -> None:
     # 200 hPa parcel for the same fall speed -- a fixed Pa/s rate would give 1.0.
     ratio = one_step_drop(300.0, v_fall) / one_step_drop(200.0, v_fall)
     assert ratio == pytest.approx(1.5, rel=1e-3)
+
+
+def test_emulated_crystal_radius_grows_monotonically() -> None:
+    """The CoCiP-surrogate crystal radius grows monotonically with age at micron scale."""
+    age_s = np.array([0.0, 600.0, 1800.0, 3600.0, 10800.0])  # 0, 10, 30, 60, 180 min
+    r = emulated_crystal_radius(age_s)
+    assert np.all(np.diff(r) > 0)  # monotone growth
+    assert np.all((r > 0.5e-6) & (r < 50e-6))  # microns, physical for young contrails
+
+
+def test_dry_advection_microphysical_sedimentation_curves() -> None:
+    """Microphysical sedimentation gives a CoCiP-like *curving* descent (growing crystals).
+
+    In a still atmosphere the only level change is sedimentation. With
+    ``microphysical_sedimentation`` the fall speed tracks the age-growing crystal radius,
+    so the descent accelerates with age -- unlike a constant fall speed. Also confirmed:
+    it descends further than the (kinematic) no-sedimentation run.
+    """
+    t_air = 220.0
+    lon0, lat0 = 0.0, 45.0
+    longitude = np.arange(lon0 - 1.0, lon0 + 1.01, 0.5)
+    latitude = np.arange(lat0 - 1.0, lat0 + 1.01, 0.5)
+    level = np.array([100.0, 150.0, 200.0, 250.0, 300.0])
+    time = np.array(["2022-01-01T00:00:00", "2022-01-01T06:00:00"], dtype="datetime64[ns]")
+    met = MetDataset.from_coords(longitude=longitude, latitude=latitude, level=level, time=time)
+    met["eastward_wind"] = xr.DataArray(np.zeros(met.shape), coords=met.coords)
+    met["northward_wind"] = xr.DataArray(np.zeros(met.shape), coords=met.coords)
+    met["lagrangian_tendency_of_air_pressure"] = xr.DataArray(
+        np.zeros(met.shape), coords=met.coords
+    )
+    met["air_temperature"] = xr.DataArray(np.full(met.shape, t_air), coords=met.coords)
+    met["geopotential"] = xr.DataArray(np.full(met.shape, 1.0e5), coords=met.coords)
+
+    src = GeoVectorDataset(longitude=[lon0], latitude=[lat0], level=[200.0], time=[time[0]])
+    params = {
+        "azimuth": None,
+        "width": None,
+        "depth": None,
+        "max_age": np.timedelta64(3, "h"),
+        "dt_integration": np.timedelta64(20, "m"),
+        "microphysical_sedimentation": True,
+    }
+    out = DryAdvection(met, params).eval(src)
+    levels = out.dataframe.sort_values("age")["level"].to_numpy()
+
+    # Descends monotonically (pressure increases) and the per-step drop grows with age
+    # (crystals grow -> faster fall) -- the curving signature a constant knob lacks.
+    drops = np.diff(levels)
+    assert np.all(drops > 0)
+    assert drops[-1] > 2.0 * drops[0]
+
+    # Descends further than the kinematic (no-sedimentation) run, which is unchanged in a
+    # still atmosphere. The ~2.7 hPa descent over 3 h corresponds to ~180 m.
+    kinematic = DryAdvection(met, {**params, "microphysical_sedimentation": False}).eval(src)
+    assert levels[-1] > kinematic.dataframe.sort_values("age")["level"].to_numpy()[-1] + 1.0
