@@ -752,6 +752,26 @@ def test_flight_overrides(fl: Flight, met: MetDataset, rad: MetDataset) -> None:
         cocip.eval(fl3)
 
 
+def test_soot_ice_nucleation_is_additive_opt_in(
+    fl: Flight, met: MetDataset, rad: MetDataset
+) -> None:
+    """The soot-in-ISSR onset pathway is opt-in and unimplemented.
+
+    With the flag off, ``Cocip`` is canonical (covered by the golden tests). Turning it on
+    routes through the research hooks in :mod:`soot_ice_nucleation`, which raise until the
+    physics is supplied, so the pathway cannot silently produce unvalidated results.
+    """
+    cocip = Cocip(
+        met=met.copy(),
+        rad=rad.copy(),
+        process_emissions=False,
+        soot_ice_nucleation=True,
+        humidity_scaling=ExponentialBoostHumidityScaling(),
+    )
+    with pytest.raises(NotImplementedError, match="soot_issr_onset is a research hook"):
+        cocip.eval(fl)
+
+
 def test_flight_overrides_emissions(
     fl: Flight, met: MetDataset, rad: MetDataset, bada_model: AircraftPerformance
 ) -> None:

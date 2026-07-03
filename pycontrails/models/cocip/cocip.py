@@ -32,6 +32,7 @@ from pycontrails.models.cocip import (
     contrail_properties,
     radiative_forcing,
     radiative_heating,
+    soot_ice_nucleation,
     unterstrasser_wake_vortex,
     wake_vortex,
     wind_shear,
@@ -767,8 +768,26 @@ class Cocip(Model):
             self.source["G"],
         )
 
-        # create a new Flight only at points where "sac" == 1
+        # create a new Flight only at points where "sac" == 1 (canonical SAC onset)
         filt = self.source["sac"] == 1.0
+
+        # Additive, opt-in soot-in-ISSR onset pathway. When enabled, contrails may also
+        # form where soot nucleates ice in ice-supersaturated air even if the SAC fails,
+        # and each waypoint is tagged with its onset mechanism. With the flag off this
+        # block is skipped, so `filt` (and every downstream result) is bit-identical to
+        # canonical CoCiP; the "soot_issr"-tagged waypoints are the outliers.
+        if self.params["soot_ice_nucleation"]:
+            soot_filt = soot_ice_nucleation.soot_issr_onset(
+                self.source["specific_humidity"],
+                self.source["air_temperature"],
+                self.source.air_pressure,
+                self.source.get_data_or_attr("nvpm_ei_n"),
+            )
+            self.source["onset_mechanism"] = np.where(
+                filt, "sac", np.where(soot_filt, "soot_issr", "none")
+            )
+            filt = filt | soot_filt
+
         if self.params["filter_sac"]:
             self._sac_flight = self.source.filter(filt)
             logger.debug(
@@ -1034,6 +1053,23 @@ class Cocip(Model):
             f_surv = contrail_properties.ice_particle_survival_fraction(iwc, iwc_1)
 
         n_ice_per_m_1 = n_ice_per_m_0 * f_surv
+
+        # Additive soot-in-ISSR route: for soot-onset waypoints (tagged upstream), replace
+        # the SAC droplet-freezing initial condition with the deposition-nucleation one.
+        # Skipped entirely (hence canonical) when soot_ice_nucleation is disabled.
+        if self.params["soot_ice_nucleation"]:
+            is_soot = self._sac_flight["onset_mechanism"] == "soot_issr"
+            if np.any(is_soot):
+                nvpm = np.broadcast_to(nvpm_ei_n, air_temperature.shape)
+                n_ice_soot, iwc_soot = soot_ice_nucleation.deposition_initial_ice(
+                    nvpm[is_soot],
+                    fuel_dist[is_soot],
+                    air_temperature[is_soot],
+                    specific_humidity[is_soot],
+                    air_pressure[is_soot],
+                )
+                n_ice_per_m_1[is_soot] = n_ice_soot
+                iwc_1[is_soot] = iwc_soot
 
         # Check for persistent initial_contrails
         persistent_1 = contrail_properties.initial_persistent(iwc_1, rhi_1)

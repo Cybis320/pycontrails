@@ -138,6 +138,17 @@ class CocipParams(AdvectionBuffers):
     #: to allow for false negative calibration and model uncertainty studies.
     filter_initially_persistent: bool = True
 
+    #: Enable the **additive, opt-in** soot-in-ISSR ice-nucleation onset pathway.
+    #: When ``True``, contrails may also form where soot acts as a depositional/immersion
+    #: ice nucleus in ice-supersaturated air, even where the Schmidt-Appleman criterion
+    #: (SAC) is not satisfied, and each waypoint is tagged with an ``onset_mechanism``
+    #: column (``"sac"`` / ``"soot_issr"`` / ``"none"``). This is *additive*: with the
+    #: default ``False`` the model is bit-identical to canonical CoCiP, so canonical
+    #: results are preserved and the ``"soot_issr"``-tagged waypoints are the outliers.
+    #: The onset criterion and the deposition-nucleation initial condition are supplied by
+    #: :mod:`pycontrails.models.cocip.soot_ice_nucleation` (research parameterisations).
+    soot_ice_nucleation: bool = False
+
     #: Continue evolving contrail waypoints ``persistent_buffer`` beyond
     #: end of contrail life.
     #: Passing in a non-default value is unusual, but is included
