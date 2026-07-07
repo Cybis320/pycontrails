@@ -438,6 +438,12 @@ def test_emulated_crystal_radius_grows_monotonically() -> None:
     assert np.all(np.diff(r) > 0)  # monotone growth
     assert np.all((r > 0.5e-6) & (r < 50e-6))  # microns, physical for young contrails
 
+    # RHi modulation: more supersaturation -> larger crystals, and it changes the age-only value.
+    r_low = emulated_crystal_radius(age_s, rhi=np.full_like(age_s, 1.1))
+    r_high = emulated_crystal_radius(age_s, rhi=np.full_like(age_s, 1.5))
+    assert np.all(r_high > r_low)
+    assert np.all(r_low != r)
+
 
 def test_dry_advection_microphysical_sedimentation_curves() -> None:
     """Microphysical sedimentation gives a CoCiP-like *curving* descent (growing crystals).
@@ -460,6 +466,8 @@ def test_dry_advection_microphysical_sedimentation_curves() -> None:
         np.zeros(met.shape), coords=met.coords
     )
     met["air_temperature"] = xr.DataArray(np.full(met.shape, t_air), coords=met.coords)
+    # Supersaturated (RHi ~ 150% near 200 hPa) so the RHi-modulated crystal growth is active.
+    met["specific_humidity"] = xr.DataArray(np.full(met.shape, 1.3e-4), coords=met.coords)
     met["geopotential"] = xr.DataArray(np.full(met.shape, 1.0e5), coords=met.coords)
 
     src = GeoVectorDataset(longitude=[lon0], latitude=[lat0], level=[200.0], time=[time[0]])
@@ -481,6 +489,6 @@ def test_dry_advection_microphysical_sedimentation_curves() -> None:
     assert drops[-1] > 2.0 * drops[0]
 
     # Descends further than the kinematic (no-sedimentation) run, which is unchanged in a
-    # still atmosphere. The ~2.7 hPa descent over 3 h corresponds to ~180 m.
+    # still atmosphere (the RHi modulation shrinks the crystals, so the descent is modest).
     kinematic = DryAdvection(met, {**params, "microphysical_sedimentation": False}).eval(src)
-    assert levels[-1] > kinematic.dataframe.sort_values("age")["level"].to_numpy()[-1] + 1.0
+    assert levels[-1] > kinematic.dataframe.sort_values("age")["level"].to_numpy()[-1] + 0.3

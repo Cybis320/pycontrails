@@ -835,25 +835,45 @@ def ice_particle_mass(r_ice_vol: npt.NDArray[np.floating]) -> npt.NDArray[np.flo
     return ((4 / 3) * np.pi * r_ice_vol**3) * constants.rho_ice
 
 
-def emulated_crystal_radius(age_s: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+# Supersaturation modulation of the age-only crystal-radius surrogate, calibrated against
+# Cocip: r_ice(Cocip) / r_age(fit) ~ COEFF * s**EXPONENT, with s = RHi - 1. The 1/3 exponent
+# is the equilibrium depositional-growth law (r ~ (excess vapour)**(1/3)); a fit to Cocip's
+# r_ice over physical ISSR (RHi 100-160%) gives exponent 0.30 and this coefficient. The
+# age-only fit corresponds to high supersaturation, so this scales it *down* in moderate ISSR.
+_RHI_MOD_COEFF = 0.75
+_RHI_MOD_EXPONENT = 1.0 / 3.0
+_RHI_MOD_S_FLOOR = 0.02  # floor s (crystals do not vanish near ice saturation)
+_RHI_MOD_S_CAP = 1.0  # cap at RHi = 200%; beyond is unphysical
+
+
+def emulated_crystal_radius(
+    age_s: npt.NDArray[np.floating],
+    rhi: npt.NDArray[np.floating] | None = None,
+) -> npt.NDArray[np.floating]:
     r"""Mean ice-particle volume radius as a function of contrail age (a CoCiP surrogate).
 
     A closed-form surrogate for the mean crystal radius that a full CoCiP microphysics run
     would produce, *avoiding* the plume-dilution vapour budget: a quadratic-in-log-age fit
-    to the mean crystal radius of Fig. 7 of :cite:`schumannContrailCirrusPrediction2012`.
-    It is a function of age alone (not humidity), so it captures the dominant growth
-    *curvature* -- which a constant fall speed misses -- but not the local supersaturation
-    dependence. Physically meaningful only in ice-supersaturated air (RHi > 100%).
+    to the mean crystal radius of Fig. 7 of :cite:`schumannContrailCirrusPrediction2012`
+    (fit coefficients follow the ``contrailcirrus/google-contrails-attribution-reference``
+    implementation). Physically meaningful only in ice-supersaturated air (RHi > 100%).
 
-    This is the surrogate used for unconditional "wet advection": a CoCiP-like sedimentation
-    fall speed for every flight, independent of the SAC / persistence gate. Composed with
-    :func:`ice_particle_terminal_fall_speed` it gives ``v_t(age)``. The fit coefficients
-    follow the ``contrailcirrus/google-contrails-attribution-reference`` implementation.
+    The age-only fit captures the dominant growth *curvature* -- which a constant fall speed
+    misses -- but not the local supersaturation dependence, which drives the spread against
+    Cocip. Passing ``rhi`` applies the supersaturation modulation
+    :math:`r \to r \cdot C\, s^{1/3}` (``s = RHi - 1``, the equilibrium depositional-growth
+    law), calibrated to Cocip's ``r_ice`` and validated to tighten the match. This is the
+    surrogate used for unconditional "wet advection": a CoCiP-like sedimentation fall speed
+    for every flight, independent of the SAC / persistence gate. Composed with
+    :func:`ice_particle_terminal_fall_speed` it gives ``v_t(age, RHi)``.
 
     Parameters
     ----------
     age_s : npt.NDArray[np.floating]
         Contrail age since formation, [:math:`s`].
+    rhi : npt.NDArray[np.floating], optional
+        Relative humidity over ice as a *ratio* (1 = ice saturation). If given, apply the
+        supersaturation modulation; if ``None``, return the age-only surrogate.
 
     Returns
     -------
@@ -866,7 +886,11 @@ def emulated_crystal_radius(age_s: npt.NDArray[np.floating]) -> npt.NDArray[np.f
     """
     # 60 s offset avoids log(0) at formation; the fit is in log(age in hours).
     log_t = np.log((np.asarray(age_s, dtype=float) + 60.0) / 3600.0)
-    return np.exp(0.61185313 * log_t + 0.08065007 * log_t**2 + 1.48711988) * 1e-6
+    r = np.exp(0.61185313 * log_t + 0.08065007 * log_t**2 + 1.48711988) * 1e-6
+    if rhi is not None:
+        s = np.clip(np.asarray(rhi, dtype=float) - 1.0, _RHI_MOD_S_FLOOR, _RHI_MOD_S_CAP)
+        r = r * _RHI_MOD_COEFF * s**_RHI_MOD_EXPONENT
+    return r
 
 
 def phase_relaxation_rate(

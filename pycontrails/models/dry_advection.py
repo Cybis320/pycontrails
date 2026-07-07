@@ -373,6 +373,7 @@ def _perform_interp_for_step(
     vector: GeoVectorDataset,
     dz_m: float,
     need_air_temperature: bool = False,
+    need_specific_humidity: bool = False,
     **interp_kwargs: Any,
 ) -> None:
     """Perform all interpolation required for one step of advection."""
@@ -386,9 +387,10 @@ def _perform_interp_for_step(
     air_pressure = vector.setdefault("air_pressure", vector.air_pressure)
 
     az = vector.get("azimuth")
-    # Geometry mode (azimuth set) always needs air_temperature; pointwise needs it
-    # only for a vertical term (downwash or sedimentation).
-    want_temperature = need_air_temperature or az is not None
+    # Geometry mode (azimuth set) always needs air_temperature; pointwise needs it only for
+    # a vertical term (downwash or sedimentation). RHi-modulated sedimentation additionally
+    # needs specific_humidity (and hence air_temperature) to form the supersaturation.
+    want_temperature = need_air_temperature or need_specific_humidity or az is not None
 
     def store_group(
         specs: list[tuple[str, str]],
@@ -415,6 +417,8 @@ def _perform_interp_for_step(
     ]
     if want_temperature:
         start.append(("air_temperature", "air_temperature"))
+    if need_specific_humidity:
+        start.append(("specific_humidity", "specific_humidity"))
     store_group(start)
 
     if az is None:
@@ -611,7 +615,12 @@ def _evolve_one_step(
     downwash_enabled = downwash_distance is not None
     need_air_temperature = sedimentation_enabled or downwash_enabled
     _perform_interp_for_step(
-        met, vector, dz_m, need_air_temperature=need_air_temperature, **interp_kwargs
+        met,
+        vector,
+        dz_m,
+        need_air_temperature=need_air_temperature,
+        need_specific_humidity=microphysical_sedimentation,
+        **interp_kwargs,
     )
 
     # Sedimentation as a density-aware pressure tendency rho*g*v (Pa/s). Recomputed
@@ -620,11 +629,14 @@ def _evolve_one_step(
     if sedimentation_enabled:
         rho_air = vector["air_pressure"] / (constants.R_d * vector["air_temperature"])
         if microphysical_sedimentation:
-            # CoCiP-like fall speed: the mean crystal radius grows with contrail age, then
-            # the Spichtinger terminal velocity -- a *curving* descent, applied
-            # unconditionally (no SAC/persistence gate). See emulated_crystal_radius.
+            # CoCiP-like fall speed: the mean crystal radius grows with contrail age and is
+            # modulated by local supersaturation (RHi), then the Spichtinger terminal
+            # velocity -- a *curving* descent, applied unconditionally (no SAC gate).
             age_s = vector["age"] / np.timedelta64(1, "s")
-            r_ice = contrail_properties.emulated_crystal_radius(age_s)
+            rhi = thermo.rhi(
+                vector["specific_humidity"], vector["air_temperature"], vector["air_pressure"]
+            )
+            r_ice = contrail_properties.emulated_crystal_radius(age_s, rhi=rhi)
             v_sed: npt.NDArray[np.floating] | float = (
                 contrail_properties.ice_particle_terminal_fall_speed(
                     vector["air_pressure"], vector["air_temperature"], r_ice
