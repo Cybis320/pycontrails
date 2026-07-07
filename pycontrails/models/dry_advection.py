@@ -27,7 +27,7 @@ from pycontrails.core.met_var import (
 )
 from pycontrails.core.vector import GeoVectorDataset
 from pycontrails.models._advection import advect_centerline_rk4, interp_colocated
-from pycontrails.models.cocip import contrail_properties, wind_shear
+from pycontrails.models.cocip import contrail_properties, wake_vortex, wind_shear
 from pycontrails.physics import constants, geo, thermo
 
 
@@ -93,19 +93,21 @@ class DryAdvectionParams(models.AdvectionBuffers):
     #: source points as well as evolved points.
     include_source_in_output: bool = False
 
-    #: Apply a simplified wake-vortex downwash. If True, each waypoint is displaced
-    #: downward once by :attr:`downwash_distance` at formation (age 0), approximating
-    #: the descent of the wake vortices before they break up. The descent is applied
-    #: as a single hydrostatic level offset, so it is independent of
-    #: :attr:`dt_integration`.
+    #: Apply a wake-vortex downwash. If True, each waypoint is displaced downward once by
+    #: the contrail-centroid sinking at formation (age 0), approximating the descent of the
+    #: wake vortices before they break up. Applied as a single hydrostatic level offset, so
+    #: it is independent of :attr:`dt_integration`.
     #: .. versionadded:: 0.54.12
     apply_downwash: bool = False
 
-    #: Downward displacement applied once at formation when :attr:`apply_downwash`
-    #: is True, [:math:`m`]. The default of 300 m is a representative wake-vortex
-    #: descent depth.
+    #: Downward displacement applied once at formation when :attr:`apply_downwash` is True,
+    #: [:math:`m`]. If ``None`` (the default), the **per-waypoint** contrail-centroid sinking
+    #: ``0.25 * dz_max`` is computed from the met via
+    #: :func:`wake_vortex.max_downward_displacement` (using the source's ``wingspan``,
+    #: ``aircraft_mass`` and ``true_airspeed`` -- see :meth:`_compute_wake_downwash`), matching
+    #: CoCiP. A float overrides this with a fixed constant descent for every waypoint.
     #: .. versionadded:: 0.54.12
-    downwash_distance: float = 300.0
+    downwash_distance: float | None = None
 
 
 class DryAdvection(models.Model):
@@ -203,6 +205,13 @@ class DryAdvection(models.Model):
             msg = "No source coordinates intersect met data."
             raise ValueError(msg)
 
+        # Wake-vortex downwash: precompute the per-waypoint contrail-centroid sinking from the
+        # met at formation, while the source still carries aircraft attrs (before
+        # _prepare_source strips them), unless overridden by a constant downwash_distance.
+        apply_downwash = self.params["apply_downwash"]
+        if apply_downwash and self.params["downwash_distance"] is None:
+            self._compute_wake_downwash()
+
         self.source = self._prepare_source()
 
         interp_kwargs = self.interp_kwargs
@@ -246,11 +255,6 @@ class DryAdvection(models.Model):
             t0 = vector1["time"].min()
             met = maybe_downselect_mds(self.met, met, t0, t)
 
-            # One-time wake-vortex downwash distance (m), or None if disabled.
-            downwash_distance = (
-                self.params["downwash_distance"] if self.params["apply_downwash"] else None
-            )
-
             vector2 = _evolve_one_step(
                 met,
                 vector1,
@@ -260,7 +264,8 @@ class DryAdvection(models.Model):
                 dz_m=dz_m,
                 max_depth=max_depth,
                 verbose_outputs=verbose_outputs,
-                downwash_distance=downwash_distance,
+                apply_downwash=apply_downwash,
+                downwash_distance=self.params["downwash_distance"],
                 **interp_kwargs,
             )
 
@@ -312,6 +317,8 @@ class DryAdvection(models.Model):
         columns = ["longitude", "latitude", "level", "time", "age", "waypoint"]
         if "flight_id" in self.source:
             columns.append("flight_id")
+        if "downwash_centroid" in self.source:  # precomputed wake-vortex downwash
+            columns.append("downwash_centroid")
 
         azimuth = self.get_source_param("azimuth", set_attr=False)
         if azimuth is None:
@@ -366,6 +373,98 @@ class DryAdvection(models.Model):
         buffers["time_buffer"] = (np.timedelta64(0, "ns"), max_age)
 
         self.met = self.source.downselect_met(self.met, **buffers)
+
+    def _resolve_aircraft_param(
+        self, key: str, ps_attr: str, ps_scale: float = 1.0
+    ) -> npt.NDArray[np.floating]:
+        """Resolve a per-waypoint aircraft parameter from source data/attr, else the PS db.
+
+        Falls back to ``ps_scale * getattr(PSAircraftEngineParams, ps_attr)`` looked up by the
+        source ``aircraft_type`` (e.g. ``aircraft_mass`` -> ``0.85 * amass_mtow``).
+        """
+        src = self.source
+        if key in src:
+            return np.asarray(src[key], dtype=float)
+        val = src.attrs.get(key)
+        if val is not None:
+            return np.full(src.size, float(val))
+
+        from pycontrails.models.ps_model.ps_aircraft_params import load_aircraft_engine_params
+
+        atype = src["aircraft_type"] if "aircraft_type" in src else src.attrs.get("aircraft_type")
+        if atype is None:
+            msg = f"Wake-vortex downwash needs '{key}' or 'aircraft_type' on the source."
+            raise ValueError(msg)
+        ps = load_aircraft_engine_params()
+        atype_arr = np.atleast_1d(np.asarray(atype))
+        out = np.empty(src.size, dtype=float)
+        if atype_arr.size == 1:
+            out[:] = getattr(ps[str(atype_arr[0])], ps_attr) * ps_scale
+        else:
+            for t in np.unique(atype_arr):
+                out[atype_arr == t] = getattr(ps[str(t)], ps_attr) * ps_scale
+        return out
+
+    def _compute_wake_downwash(self) -> None:
+        r"""Attach the per-waypoint wake-vortex downwash to the source.
+
+        Computes the CoCiP contrail-centroid sinking ``0.25 * dz_max`` at each formation
+        waypoint from the met (:func:`wake_vortex.max_downward_displacement`), using the source
+        ``wingspan``, ``aircraft_mass`` (default ``0.85 * MTOW`` from the PS database) and
+        ``true_airspeed``, and stores it in ``source["downwash_centroid"]`` [:math:`m`].
+        """
+        src = self.source
+        wingspan = self._resolve_aircraft_param("wingspan", "wing_span")
+        aircraft_mass = self._resolve_aircraft_param("aircraft_mass", "amass_mtow", 0.85)
+        if "true_airspeed" in src:
+            true_airspeed = np.asarray(src["true_airspeed"], dtype=float)
+        elif src.attrs.get("true_airspeed") is not None:
+            true_airspeed = np.full(src.size, float(src.attrs["true_airspeed"]))
+        else:
+            msg = "Wake-vortex downwash needs 'true_airspeed' on the source."
+            raise ValueError(msg)
+
+        # Met at formation, plus a layer dz_m lower for stratification and shear.
+        dz_m = self.params["dz_m"]
+        interp_kwargs = self.interp_kwargs
+        air_temperature = models.interpolate_met(self.met, src, "air_temperature", **interp_kwargs)
+        u_wind = models.interpolate_met(self.met, src, "eastward_wind", "u_wind", **interp_kwargs)
+        v_wind = models.interpolate_met(self.met, src, "northward_wind", "v_wind", **interp_kwargs)
+        air_pressure = src.air_pressure
+        air_pressure_lower = thermo.pressure_dz(air_temperature, air_pressure, dz_m)
+        level_lower = air_pressure_lower / 100.0
+        air_temperature_lower = models.interpolate_met(
+            self.met,
+            src,
+            "air_temperature",
+            "air_temperature_lower",
+            level=level_lower,
+            **interp_kwargs,
+        )
+        u_wind_lower = models.interpolate_met(
+            self.met, src, "eastward_wind", "u_wind_lower", level=level_lower, **interp_kwargs
+        )
+        v_wind_lower = models.interpolate_met(
+            self.met, src, "northward_wind", "v_wind_lower", level=level_lower, **interp_kwargs
+        )
+        dT_dz = thermo.T_potential_gradient(
+            air_temperature, air_pressure, air_temperature_lower, air_pressure_lower, dz_m
+        )
+        ds_dz = wind_shear.wind_shear(u_wind, u_wind_lower, v_wind, v_wind_lower, dz_m)
+
+        dz_max = wake_vortex.max_downward_displacement(
+            wingspan,
+            true_airspeed,
+            aircraft_mass,
+            air_temperature,
+            dT_dz,
+            ds_dz,
+            air_pressure,
+            effective_vertical_resolution=2000.0,
+            wind_shear_enhancement_exponent=0.5,
+            turbulent_vertical_velocity_scale=0.1,
+        )
+        src["downwash_centroid"] = 0.25 * dz_max  # contrail-centroid sinking, [m]
 
 
 def _perform_interp_for_step(
@@ -601,6 +700,7 @@ def _evolve_one_step(
     dz_m: float,
     max_depth: float | None,
     verbose_outputs: bool,
+    apply_downwash: bool = False,
     downwash_distance: float | None = None,
     **interp_kwargs: Any,
 ) -> GeoVectorDataset:
@@ -612,7 +712,7 @@ def _evolve_one_step(
     # Both downwash and sedimentation need air density (rho = p / (R_d T)), so they
     # require an interpolated air temperature even in pointwise mode.
     sedimentation_enabled = sedimentation_velocity != 0.0 or microphysical_sedimentation
-    downwash_enabled = downwash_distance is not None
+    downwash_enabled = apply_downwash
     need_air_temperature = sedimentation_enabled or downwash_enabled
     _perform_interp_for_step(
         met,
@@ -653,13 +753,19 @@ def _evolve_one_step(
         met, vector, t, extra_dp_dt=extra_dp_dt, **interp_kwargs
     )
 
-    # Wake-vortex downwash: a one-time descent by ``downwash_distance`` applied at
-    # formation (age == 0) as a single hydrostatic level offset. Because it is a
-    # one-shot offset rather than a per-step velocity, the descent is independent of
-    # ``dt_integration``.
-    if downwash_distance is not None:
+    # Wake-vortex downwash: a one-time descent applied at formation (age == 0) as a single
+    # hydrostatic level offset -- independent of ``dt_integration``. The descent is the
+    # per-waypoint contrail-centroid sinking precomputed by _compute_wake_downwash
+    # ("downwash_centroid", the default), or a constant ``downwash_distance`` override.
+    if downwash_enabled:
+        # Per-waypoint contrail-centroid sinking (default) or the constant override.
+        if "downwash_centroid" in vector:
+            distance: npt.NDArray[np.floating] | float = vector["downwash_centroid"]
+        else:
+            assert downwash_distance is not None
+            distance = downwash_distance
         rho_air = vector["air_pressure"] / (constants.R_d * vector["air_temperature"])
-        delta_level = rho_air * constants.g * downwash_distance / 100.0  # hydrostatic, [hPa]
+        delta_level = rho_air * constants.g * distance / 100.0  # hydrostatic, [hPa]
         is_formation = vector["age"] == np.timedelta64(0, "ns")
         level_2 = level_2 + np.where(is_formation, delta_level, 0.0)
 
@@ -677,6 +783,10 @@ def _evolve_one_step(
     flight_id = vector.get("flight_id")
     if flight_id is not None:
         out["flight_id"] = flight_id
+
+    downwash_centroid = vector.get("downwash_centroid")
+    if downwash_centroid is not None:  # carry the per-waypoint downwash forward
+        out["downwash_centroid"] = downwash_centroid
 
     azimuth = vector.get("azimuth")
     if azimuth is None:

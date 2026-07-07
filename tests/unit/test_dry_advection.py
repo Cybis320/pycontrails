@@ -13,7 +13,7 @@ from pycontrails.models.cocip import Cocip
 from pycontrails.models.cocip.contrail_properties import emulated_crystal_radius
 from pycontrails.models.dry_advection import DryAdvection
 from pycontrails.models.humidity_scaling import ConstantHumidityScaling
-from pycontrails.physics import geo
+from pycontrails.physics import geo, units
 
 
 @pytest.fixture()
@@ -373,6 +373,74 @@ def test_dry_advection_downwash_displacement() -> None:
 
     # ...and the descent is independent of the integration step.
     assert drop_30m == pytest.approx(drop_5m, abs=1e-6)
+
+
+def test_dry_advection_wake_vortex_downwash() -> None:
+    """Physics downwash (downwash_distance=None) computes a per-waypoint centroid from the met.
+
+    The contrail-centroid sinking ``0.25 * dz_max`` is derived from the aircraft and met via
+    ``wake_vortex.max_downward_displacement``, resolving wingspan/mass from the source (or the
+    PS database by ``aircraft_type``, with mass defaulting to ``0.85 * MTOW``).
+    """
+    lon0, lat0 = 0.0, 45.0
+    longitude = np.arange(lon0 - 1.0, lon0 + 1.01, 0.5)
+    latitude = np.arange(lat0 - 1.0, lat0 + 1.01, 0.5)
+    level = np.array([150.0, 200.0, 250.0, 300.0, 350.0])
+    time = np.array(["2022-01-01T00:00:00", "2022-01-01T06:00:00"], dtype="datetime64[ns]")
+    met = MetDataset.from_coords(longitude=longitude, latitude=latitude, level=level, time=time)
+    met["eastward_wind"] = xr.DataArray(np.zeros(met.shape), coords=met.coords)
+    met["northward_wind"] = xr.DataArray(np.zeros(met.shape), coords=met.coords)
+    met["lagrangian_tendency_of_air_pressure"] = xr.DataArray(
+        np.zeros(met.shape), coords=met.coords
+    )
+    met["air_temperature"] = xr.DataArray(np.full(met.shape, 220.0), coords=met.coords)
+    met["geopotential"] = xr.DataArray(np.full(met.shape, 1.0e5), coords=met.coords)
+
+    df = pd.DataFrame(
+        {
+            "longitude": np.linspace(lon0 - 0.5, lon0 + 0.5, 8),
+            "latitude": np.full(8, lat0),
+            "altitude": np.full(8, 11000.0),
+            "time": pd.date_range(time[0], time[0] + pd.Timedelta("20min"), periods=8),
+        }
+    )
+    params = {
+        "azimuth": None,
+        "width": None,
+        "depth": None,
+        "max_age": np.timedelta64(1, "h"),
+        "dt_integration": np.timedelta64(10, "m"),
+        "apply_downwash": True,
+        "downwash_distance": None,  # physics: per-waypoint centroid
+    }
+
+    # Explicit aircraft params on the source.
+    fl = Flight(
+        df.copy(),
+        attrs={
+            "flight_id": "x",
+            "wingspan": 60.0,
+            "true_airspeed": 240.0,
+            "aircraft_mass": 200000.0,
+        },
+    )
+    out = DryAdvection(met, params).eval(fl)
+    centroid = out["downwash_centroid"]
+    assert np.all(np.isfinite(centroid)) and np.all(centroid > 0)
+    assert 10.0 < float(np.nanmean(centroid)) < 400.0  # physical centroid sink [m]
+    assert units.pl_to_m(out["level"]).min() < 11000.0  # the descent was applied
+
+    # PS fallback by aircraft_type (mass = 0.85 * MTOW, wingspan from the PS db).
+    fl2 = Flight(
+        df.copy(), attrs={"flight_id": "y", "aircraft_type": "A359", "true_airspeed": 240.0}
+    )
+    out2 = DryAdvection(met, params).eval(fl2)
+    assert np.all(out2["downwash_centroid"] > 0)
+
+    # Missing aircraft info raises a clear error.
+    fl3 = Flight(df.copy(), attrs={"flight_id": "z", "true_airspeed": 240.0})
+    with pytest.raises(ValueError, match="wingspan"):
+        DryAdvection(met, params).eval(fl3)
 
 
 def test_dry_advection_sedimentation_density_aware() -> None:
