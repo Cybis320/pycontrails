@@ -11,7 +11,7 @@ import xarray as xr
 from pycontrails import Flight, GeoVectorDataset, MetDataset
 from pycontrails.models.cocip import Cocip
 from pycontrails.models.cocip.contrail_properties import emulated_crystal_radius
-from pycontrails.models.dry_advection import DryAdvection
+from pycontrails.models.dry_advection import DryAdvection, MoistAdvection, MoistAdvectionParams
 from pycontrails.models.humidity_scaling import ConstantHumidityScaling
 from pycontrails.physics import geo, units
 
@@ -426,7 +426,8 @@ def test_dry_advection_wake_vortex_downwash() -> None:
     )
     out = DryAdvection(met, params).eval(fl)
     centroid = out["downwash_centroid"]
-    assert np.all(np.isfinite(centroid)) and np.all(centroid > 0)
+    assert np.all(np.isfinite(centroid))
+    assert np.all(centroid > 0)
     assert 10.0 < float(np.nanmean(centroid)) < 400.0  # physical centroid sink [m]
     assert units.pl_to_m(out["level"]).min() < 11000.0  # the descent was applied
 
@@ -441,6 +442,21 @@ def test_dry_advection_wake_vortex_downwash() -> None:
     fl3 = Flight(df.copy(), attrs={"flight_id": "z", "true_airspeed": 240.0})
     with pytest.raises(ValueError, match="wingspan"):
         DryAdvection(met, params).eval(fl3)
+
+
+def test_moist_advection_defaults() -> None:
+    """MoistAdvection is a DryAdvection preset with the wet physics on in centerline mode."""
+    assert issubclass(MoistAdvection, DryAdvection)
+    p = MoistAdvectionParams()
+    # Wake downwash (physics, per-waypoint) and RHi-modulated sedimentation on by default.
+    assert p.apply_downwash is True
+    assert p.downwash_distance is None
+    assert p.microphysical_sedimentation is True
+    # Pointwise centerline (no wind-shear geometry).
+    assert p.azimuth is None
+    assert p.width is None
+    assert p.depth is None
+    assert MoistAdvection.default_params is MoistAdvectionParams
 
 
 def test_dry_advection_sedimentation_density_aware() -> None:

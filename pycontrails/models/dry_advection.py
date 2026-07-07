@@ -110,6 +110,27 @@ class DryAdvectionParams(models.AdvectionBuffers):
     downwash_distance: float | None = None
 
 
+@dataclasses.dataclass
+class MoistAdvectionParams(DryAdvectionParams):
+    """Parameters for :class:`MoistAdvection`.
+
+    :class:`DryAdvection` configured to reproduce CoCiP's contrail *centerline*: pointwise
+    advection with the wake-vortex downwash and the CoCiP-like RHi-modulated microphysical
+    sedimentation enabled by default.
+    """
+
+    #: Pointwise centerline (no wind-shear geometry) by default.
+    azimuth: float | None = None
+    width: float | None = None
+    depth: float | None = None
+
+    #: Per-waypoint wake-vortex downwash on by default (``downwash_distance=None`` -> physics).
+    apply_downwash: bool = True
+
+    #: CoCiP-like RHi-modulated microphysical sedimentation on by default.
+    microphysical_sedimentation: bool = True
+
+
 class DryAdvection(models.Model):
     """Simulate "dry advection" of an emissions plume with an elliptical cross section.
 
@@ -465,6 +486,26 @@ class DryAdvection(models.Model):
             turbulent_vertical_velocity_scale=0.1,
         )
         src["downwash_centroid"] = 0.25 * dz_max  # contrail-centroid sinking, [m]
+
+
+class MoistAdvection(DryAdvection):
+    """Advect a contrail centerline with CoCiP-grade physics but no SAC/persistence gate.
+
+    A thin :class:`DryAdvection` preset with the wake-vortex downwash
+    (:attr:`DryAdvectionParams.apply_downwash`) and the CoCiP-like RHi-modulated
+    microphysical sedimentation (:attr:`DryAdvectionParams.microphysical_sedimentation`)
+    enabled by default, in pointwise (centerline) mode. It reproduces CoCiP's contrail
+    centerline -- validated on ERA5 to ~2-13 m vertical and ~0.1 km horizontal -- for
+    *every* flight, independent of the Schmidt-Appleman criterion. Requires ``wingspan``,
+    ``aircraft_mass`` and ``true_airspeed`` on the source (or ``aircraft_type`` for the
+    Poll-Schumann database fallback, with mass defaulting to ``0.85 * MTOW``).
+
+    .. versionadded:: 0.54.12
+    """
+
+    name = "moist_advection"
+    long_name = "Contrail centerline advection with wake downwash and microphysical sedimentation"
+    default_params = MoistAdvectionParams
 
 
 def _perform_interp_for_step(
