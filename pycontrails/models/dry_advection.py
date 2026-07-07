@@ -338,8 +338,9 @@ class DryAdvection(models.Model):
         columns = ["longitude", "latitude", "level", "time", "age", "waypoint"]
         if "flight_id" in self.source:
             columns.append("flight_id")
-        if "downwash_centroid" in self.source:  # precomputed wake-vortex downwash
-            columns.append("downwash_centroid")
+        for key in ("downwash_dz_max", "downwash_tmax", "downwash_p"):  # wake-vortex downwash
+            if key in self.source:
+                columns.append(key)
 
         azimuth = self.get_source_param("azimuth", set_attr=False)
         if azimuth is None:
@@ -429,10 +430,12 @@ class DryAdvection(models.Model):
     def _compute_wake_downwash(self) -> None:
         r"""Attach the per-waypoint wake-vortex downwash to the source.
 
-        Computes the CoCiP contrail-centroid sinking ``0.25 * dz_max`` at each formation
-        waypoint from the met (:func:`wake_vortex.max_downward_displacement`), using the source
-        ``wingspan``, ``aircraft_mass`` (default ``0.85 * MTOW`` from the PS database) and
-        ``true_airspeed``, and stores it in ``source["downwash_centroid"]`` [:math:`m`].
+        Computes the wake-descent profile parameters at each formation waypoint from the met
+        (:func:`wake_vortex.downward_displacement_params`), using the source ``wingspan``,
+        ``aircraft_mass`` (default ``0.85 * MTOW`` from the PS database) and ``true_airspeed``,
+        and stores them as ``downwash_dz_max`` [:math:`m`], ``downwash_tmax`` [:math:`s`] and
+        ``downwash_p`` on the source. The downwash block evolves the CoCiP contrail-centroid
+        sinking ``0.25 * dz_max`` from these, time-resolved per step.
         """
         src = self.source
         wingspan = self._resolve_aircraft_param("wingspan", "wing_span")
@@ -473,7 +476,10 @@ class DryAdvection(models.Model):
         )
         ds_dz = wind_shear.wind_shear(u_wind, u_wind_lower, v_wind, v_wind_lower, dz_m)
 
-        dz_max = wake_vortex.max_downward_displacement(
+        # Store the wake-descent profile parameters (not just the endpoint) so the downwash
+        # is time-resolved per step -- a one-shot at coarse dt, but the 5 s descent when the
+        # timesteps are dense in the first minutes. See the downwash block in _evolve_one_step.
+        dz_max, t_max, p = wake_vortex.downward_displacement_params(
             wingspan,
             true_airspeed,
             aircraft_mass,
@@ -481,11 +487,13 @@ class DryAdvection(models.Model):
             dT_dz,
             ds_dz,
             air_pressure,
-            effective_vertical_resolution=2000.0,
-            wind_shear_enhancement_exponent=0.5,
-            turbulent_vertical_velocity_scale=0.1,
+            2000.0,
+            0.5,
+            0.1,
         )
-        src["downwash_centroid"] = 0.25 * dz_max  # contrail-centroid sinking, [m]
+        src["downwash_dz_max"] = dz_max
+        src["downwash_tmax"] = t_max
+        src["downwash_p"] = p
 
 
 class MoistAdvection(DryAdvection):
@@ -794,21 +802,30 @@ def _evolve_one_step(
         met, vector, t, extra_dp_dt=extra_dp_dt, **interp_kwargs
     )
 
-    # Wake-vortex downwash: a one-time descent applied at formation (age == 0) as a single
-    # hydrostatic level offset -- independent of ``dt_integration``. The descent is the
-    # per-waypoint contrail-centroid sinking precomputed by _compute_wake_downwash
-    # ("downwash_centroid", the default), or a constant ``downwash_distance`` override.
+    # Wake-vortex downwash applied as a hydrostatic level offset. The default is the
+    # per-waypoint contrail-centroid sinking from the profile params precomputed by
+    # _compute_wake_downwash (time-resolved per step below); a constant ``downwash_distance``
+    # override is instead a one-shot at formation.
     if downwash_enabled:
-        # Per-waypoint contrail-centroid sinking (default) or the constant override.
-        if "downwash_centroid" in vector:
-            distance: npt.NDArray[np.floating] | float = vector["downwash_centroid"]
-        else:
-            assert downwash_distance is not None
-            distance = downwash_distance
         rho_air = vector["air_pressure"] / (constants.R_d * vector["air_temperature"])
-        delta_level = rho_air * constants.g * distance / 100.0  # hydrostatic, [hPa]
-        is_formation = vector["age"] == np.timedelta64(0, "ns")
-        level_2 = level_2 + np.where(is_formation, delta_level, 0.0)
+        if "downwash_dz_max" in vector:
+            # Time-resolved centroid descent: apply the increment z_c(age2) - z_c(age1). This
+            # is a one-shot at coarse dt (age2 >> t_max) but resolves the descent step-by-step
+            # at fine (e.g. 5 s) dt in the first minutes.
+            dz_max = vector["downwash_dz_max"]
+            t_max = vector["downwash_tmax"]
+            p = vector["downwash_p"]
+            age1 = vector["age"] / np.timedelta64(1, "s")
+            age2 = age1 + dt / np.timedelta64(1, "s")
+            zc1 = wake_vortex.downward_displacement_at(age1, dz_max, t_max, p)
+            zc2 = wake_vortex.downward_displacement_at(age2, dz_max, t_max, p)
+            descent: npt.NDArray[np.floating] = zc2 - zc1  # [m] this step
+        else:
+            # Constant override: a one-shot descent at formation.
+            assert downwash_distance is not None
+            is_formation = vector["age"] == np.timedelta64(0, "ns")
+            descent = np.where(is_formation, downwash_distance, 0.0)
+        level_2 = level_2 + rho_air * constants.g * descent / 100.0  # hydrostatic, [hPa]
 
     out = GeoVectorDataset._from_fastpath(
         {
@@ -825,9 +842,10 @@ def _evolve_one_step(
     if flight_id is not None:
         out["flight_id"] = flight_id
 
-    downwash_centroid = vector.get("downwash_centroid")
-    if downwash_centroid is not None:  # carry the per-waypoint downwash forward
-        out["downwash_centroid"] = downwash_centroid
+    for key in ("downwash_dz_max", "downwash_tmax", "downwash_p"):
+        val = vector.get(key)
+        if val is not None:  # carry the per-waypoint downwash params forward
+            out[key] = val
 
     azimuth = vector.get("azimuth")
     if azimuth is None:

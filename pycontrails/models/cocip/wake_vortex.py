@@ -408,6 +408,98 @@ def initial_contrail_depth(
     return dz_max * initial_wake_vortex_depth
 
 
+def downward_displacement_params(
+    wingspan: npt.NDArray[np.floating] | float,
+    true_airspeed: npt.NDArray[np.floating],
+    aircraft_mass: npt.NDArray[np.floating] | float,
+    air_temperature: npt.NDArray[np.floating],
+    dT_dz: npt.NDArray[np.floating],
+    ds_dz: npt.NDArray[np.floating],
+    air_pressure: npt.NDArray[np.floating],
+    effective_vertical_resolution: float,
+    wind_shear_enhancement_exponent: npt.NDArray[np.floating] | float,
+    turbulent_vertical_velocity_scale: npt.NDArray[np.floating] | float,
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+    r"""Per-waypoint parameters of the wake-descent profile: ``(dz_max, t_max, p)``.
+
+    The time-independent part of :func:`downward_displacement_profile`, split out so the
+    descent can be evaluated cheaply at many times (e.g. once per integration step, to
+    time-resolve the downwash) without recomputing the anchors. See that function for the
+    physics and references.
+
+    Returns
+    -------
+    tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], npt.NDArray[np.floating]]
+        ``dz_max`` [:math:`m`], ``t_max`` [:math:`s`] (time of maximum sinking) and the
+        decelerating shape exponent ``p``, each of shape ``(n_waypoints,)``.
+    """
+    rho_air = thermo.rho_d(air_temperature, air_pressure)
+    n_bv = thermo.brunt_vaisala_frequency(air_pressure, air_temperature, dT_dz)
+    t_0 = effective_time_scale(wingspan, true_airspeed, aircraft_mass, rho_air)
+    b_0 = wake_vortex_separation(wingspan)
+    w_0 = b_0 / t_0  # w_0 = Γ_0 / (2π b_0) = b_0 / t_0
+    dz_max = max_downward_displacement(
+        wingspan,
+        true_airspeed,
+        aircraft_mass,
+        air_temperature,
+        dT_dz,
+        ds_dz,
+        air_pressure,
+        effective_vertical_resolution=effective_vertical_resolution,
+        wind_shear_enhancement_exponent=wind_shear_enhancement_exponent,
+        turbulent_vertical_velocity_scale=turbulent_vertical_velocity_scale,
+    )
+    # Per-waypoint anchors as 1-D arrays (n_waypoints,).
+    dz_max = np.atleast_1d(np.asarray(dz_max, dtype=float))
+    t_0 = np.broadcast_to(np.atleast_1d(np.asarray(t_0, dtype=float)), dz_max.shape)
+    w_0 = np.broadcast_to(np.atleast_1d(np.asarray(w_0, dtype=float)), dz_max.shape)
+    n_bv = np.broadcast_to(np.atleast_1d(np.asarray(n_bv, dtype=float)), dz_max.shape)
+    # Time of maximum sinking: 12*t_0 (weakly) -> 5*t_0 (strongly stratified).
+    regime = np.clip(n_bv * t_0 / 0.8, 0.0, 1.0)  # 0 weak, 1 strong
+    t_max = t_0 * (12.0 - 7.0 * regime)
+    # Decelerating shape exponent; clip to >= 1 to keep the descent monotone-decelerating.
+    p = np.maximum(w_0 * t_max / dz_max, 1.0)
+    return dz_max, t_max, p
+
+
+def downward_displacement_at(
+    time_since_formation: npt.NDArray[np.floating],
+    dz_max: npt.NDArray[np.floating],
+    t_max: npt.NDArray[np.floating],
+    p: npt.NDArray[np.floating],
+    *,
+    displacement_fraction: float = 0.25,
+) -> npt.NDArray[np.floating]:
+    r"""Contrail-centroid downward displacement at given times from precomputed params.
+
+    Evaluates the decelerating descent
+    :math:`\mathrm{fraction} \cdot \Delta z_w [1 - (1 - t/t_\mathrm{max})^p]`, held at
+    :math:`\Delta z_w` for :math:`t \geq t_\mathrm{max}`. ``time_since_formation`` and the
+    params broadcast together (numpy rules), so this serves both the 2-D profile
+    (:func:`downward_displacement_profile`) and an elementwise per-waypoint evaluation (as
+    used to time-resolve the downwash a step at a time).
+
+    Parameters
+    ----------
+    time_since_formation : npt.NDArray[np.floating]
+        Age since formation, [:math:`s`].
+    dz_max, t_max, p : npt.NDArray[np.floating]
+        Profile parameters from :func:`downward_displacement_params`.
+    displacement_fraction : float
+        Centroid fraction of the vortex-core sinking. Defaults to ``0.25``.
+
+    Returns
+    -------
+    npt.NDArray[np.floating]
+        Downward displacement of the contrail centroid, [:math:`m`]. Positive is downward.
+    """
+    t = np.asarray(time_since_formation, dtype=float)
+    tau = np.minimum(t, t_max) / t_max
+    z_vortex = dz_max * (1.0 - (1.0 - tau) ** p)
+    return displacement_fraction * z_vortex
+
+
 def downward_displacement_profile(
     time_since_formation: npt.NDArray[np.floating],
     wingspan: npt.NDArray[np.floating] | float,
@@ -491,12 +583,7 @@ def downward_displacement_profile(
     - :cite:`schumannContrailCirrusPrediction2012`
     - :cite:`holzapfelProbabilisticTwoPhaseWake2003`
     """
-    rho_air = thermo.rho_d(air_temperature, air_pressure)
-    n_bv = thermo.brunt_vaisala_frequency(air_pressure, air_temperature, dT_dz)
-    t_0 = effective_time_scale(wingspan, true_airspeed, aircraft_mass, rho_air)
-    b_0 = wake_vortex_separation(wingspan)
-    w_0 = b_0 / t_0  # w_0 = Γ_0 / (2π b_0) = b_0 / t_0
-    dz_max = max_downward_displacement(
+    dz_max, t_max, p = downward_displacement_params(
         wingspan,
         true_airspeed,
         aircraft_mass,
@@ -504,26 +591,15 @@ def downward_displacement_profile(
         dT_dz,
         ds_dz,
         air_pressure,
-        effective_vertical_resolution=effective_vertical_resolution,
-        wind_shear_enhancement_exponent=wind_shear_enhancement_exponent,
-        turbulent_vertical_velocity_scale=turbulent_vertical_velocity_scale,
+        effective_vertical_resolution,
+        wind_shear_enhancement_exponent,
+        turbulent_vertical_velocity_scale,
     )
-
-    # Per-waypoint anchors as 1-D arrays (n_waypoints,).
-    dz_max = np.atleast_1d(np.asarray(dz_max, dtype=float))
-    t_0 = np.broadcast_to(np.atleast_1d(np.asarray(t_0, dtype=float)), dz_max.shape)
-    w_0 = np.broadcast_to(np.atleast_1d(np.asarray(w_0, dtype=float)), dz_max.shape)
-    n_bv = np.broadcast_to(np.atleast_1d(np.asarray(n_bv, dtype=float)), dz_max.shape)
-
-    # Time of maximum sinking: 12*t_0 (weakly) -> 5*t_0 (strongly stratified).
-    regime = np.clip(n_bv * t_0 / 0.8, 0.0, 1.0)  # 0 weak, 1 strong
-    t_max = t_0 * (12.0 - 7.0 * regime)
-
-    # Decelerating shape exponent; clip to >= 1 to keep the descent monotone-decelerating.
-    p = np.maximum(w_0 * t_max / dz_max, 1.0)
-
     t = np.atleast_1d(np.asarray(time_since_formation, dtype=float))  # (n_times,)
-    tau = np.minimum(t[None, :], t_max[:, None]) / t_max[:, None]  # (n_waypoints, n_times)
-    z_vortex = dz_max[:, None] * (1.0 - (1.0 - tau) ** p[:, None])
-
-    return displacement_fraction * z_vortex
+    return downward_displacement_at(
+        t[None, :],
+        dz_max[:, None],
+        t_max[:, None],
+        p[:, None],
+        displacement_fraction=displacement_fraction,
+    )

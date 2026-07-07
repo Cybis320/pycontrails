@@ -425,23 +425,62 @@ def test_dry_advection_wake_vortex_downwash() -> None:
         },
     )
     out = DryAdvection(met, params).eval(fl)
-    centroid = out["downwash_centroid"]
-    assert np.all(np.isfinite(centroid))
-    assert np.all(centroid > 0)
-    assert 10.0 < float(np.nanmean(centroid)) < 400.0  # physical centroid sink [m]
-    assert units.pl_to_m(out["level"]).min() < 11000.0  # the descent was applied
+    dz_max = out["downwash_dz_max"]
+    assert np.all(np.isfinite(dz_max))
+    assert np.all(dz_max > 0)
+    assert 40.0 < float(np.nanmean(dz_max)) < 1000.0  # physical vortex-core sink [m]
+    assert units.pl_to_m(out["level"]).min() < 11000.0  # the centroid descent was applied
 
     # PS fallback by aircraft_type (mass = 0.85 * MTOW, wingspan from the PS db).
     fl2 = Flight(
         df.copy(), attrs={"flight_id": "y", "aircraft_type": "A359", "true_airspeed": 240.0}
     )
     out2 = DryAdvection(met, params).eval(fl2)
-    assert np.all(out2["downwash_centroid"] > 0)
+    assert np.all(out2["downwash_dz_max"] > 0)
 
     # Missing aircraft info raises a clear error.
     fl3 = Flight(df.copy(), attrs={"flight_id": "z", "true_airspeed": 240.0})
     with pytest.raises(ValueError, match="wingspan"):
         DryAdvection(met, params).eval(fl3)
+
+
+def test_dry_advection_downwash_time_resolved() -> None:
+    """At fine dt the wake downwash descent is resolved step-by-step, not a single jump.
+
+    The descent is applied as the per-step increment z_c(age2) - z_c(age1), so with dense
+    timesteps the first minutes show a progressive (decelerating) descent rather than the
+    full sink in one step.
+    """
+    lon0, lat0 = 0.0, 45.0
+    longitude = np.arange(lon0 - 1.0, lon0 + 1.01, 0.5)
+    latitude = np.arange(lat0 - 1.0, lat0 + 1.01, 0.5)
+    level = np.array([150.0, 200.0, 250.0, 300.0])
+    time = np.array(["2022-01-01T00:00:00", "2022-01-01T06:00:00"], dtype="datetime64[ns]")
+    met = MetDataset.from_coords(longitude=longitude, latitude=latitude, level=level, time=time)
+    for k in ("eastward_wind", "northward_wind", "lagrangian_tendency_of_air_pressure"):
+        met[k] = xr.DataArray(np.zeros(met.shape), coords=met.coords)
+    met["air_temperature"] = xr.DataArray(np.full(met.shape, 220.0), coords=met.coords)
+    met["geopotential"] = xr.DataArray(np.full(met.shape, 1.0e5), coords=met.coords)
+
+    src = GeoVectorDataset(longitude=[lon0], latitude=[lat0], level=[240.0], time=[time[0]])
+    src.attrs.update(wingspan=60.0, true_airspeed=240.0, aircraft_mass=200000.0)
+    params = {
+        "azimuth": None,
+        "width": None,
+        "depth": None,
+        "max_age": np.timedelta64(6, "m"),
+        "dt_integration": np.timedelta64(15, "s"),  # fine: resolve the wake phase
+        "apply_downwash": True,
+        "downwash_distance": None,
+    }
+    out = DryAdvection(met, params).eval(src)
+    d = out.dataframe.sort_values("age")
+    drops = -np.diff(units.pl_to_m(d["level"].to_numpy()))  # descent per step [m], positive down
+
+    assert np.all(drops > -1e-6)  # monotone descent
+    assert (drops > 0.5).sum() >= 3  # spread over several steps (time-resolved, not one-shot)
+    assert drops[0] < 0.9 * drops.sum()  # not all descent in the first step
+    assert drops[-1] < drops[0]  # decelerating
 
 
 def test_moist_advection_defaults() -> None:
