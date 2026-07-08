@@ -567,6 +567,13 @@ def test_emulated_crystal_radius_grows_monotonically() -> None:
     assert np.all(r_high > r_low)
     assert np.all(r_low != r)
 
+    # Ice-number scaling: n_ice = n_ref leaves it unchanged; fewer crystals (soot) -> larger.
+    rhi = np.full_like(age_s, 1.3)
+    r_ref = emulated_crystal_radius(age_s, rhi=rhi, n_ice_per_m=np.full_like(age_s, 1.35e13))
+    np.testing.assert_allclose(r_ref, emulated_crystal_radius(age_s, rhi=rhi), rtol=0.02)
+    r_soot = emulated_crystal_radius(age_s, rhi=rhi, n_ice_per_m=np.full_like(age_s, 1e12))
+    assert np.all(r_soot > 2.0 * r_ref)  # ~13x fewer crystals -> ~2.4x radius
+
 
 def test_dry_advection_microphysical_sedimentation_curves() -> None:
     """Microphysical sedimentation gives a CoCiP-like *curving* descent (growing crystals).

@@ -845,10 +845,19 @@ _RHI_MOD_EXPONENT = 1.0 / 3.0
 _RHI_MOD_S_FLOOR = 0.02  # floor s (crystals do not vanish near ice saturation)
 _RHI_MOD_S_CAP = 1.0  # cap at RHi = 200%; beyond is unphysical
 
+# Ice-number scaling of the crystal radius: r ~ (iwc / n_ice)^(1/3). The RHi-modulated
+# surrogate is calibrated to Cocip's *SAC* crystal number; passing the conserved ice number
+# ``n_ice_per_m`` rescales it by (n_ref / n_ice)^(1/3), so soot-onset contrails (a poorer ice
+# nucleus -> fewer, larger crystals) sediment faster. ``n_ref`` is the median n_ice_per_m of
+# the calibration Cocip runs; the ratio is clipped to keep the radius factor physical.
+_CRYSTAL_N_REF = 1.35e13  # reference conserved ice number, [m^-1]
+_CRYSTAL_N_RATIO_CLIP = (0.01, 100.0)  # -> radius factor in ~[0.22, 4.64]
+
 
 def emulated_crystal_radius(
     age_s: npt.NDArray[np.floating],
     rhi: npt.NDArray[np.floating] | None = None,
+    n_ice_per_m: npt.NDArray[np.floating] | None = None,
 ) -> npt.NDArray[np.floating]:
     r"""Mean ice-particle volume radius as a function of contrail age (a CoCiP surrogate).
 
@@ -874,6 +883,12 @@ def emulated_crystal_radius(
     rhi : npt.NDArray[np.floating], optional
         Relative humidity over ice as a *ratio* (1 = ice saturation). If given, apply the
         supersaturation modulation; if ``None``, return the age-only surrogate.
+    n_ice_per_m : npt.NDArray[np.floating], optional
+        Conserved ice-crystal number per contrail metre, [:math:`m^{-1}`]. If given, rescale
+        the radius by :math:`(n_\mathrm{ref}/n_\mathrm{ice})^{1/3}` (the surrogate is
+        calibrated to Cocip's SAC number ``n_ref``), so a *soot-onset* contrail with a small
+        ``n_ice`` gets larger, faster-falling crystals. Supply it from the formation model
+        (e.g. Cocip's ``n_ice_per_m``); if ``None``, assume ``n_ref``.
 
     Returns
     -------
@@ -890,6 +905,9 @@ def emulated_crystal_radius(
     if rhi is not None:
         s = np.clip(np.asarray(rhi, dtype=float) - 1.0, _RHI_MOD_S_FLOOR, _RHI_MOD_S_CAP)
         r = r * _RHI_MOD_COEFF * s**_RHI_MOD_EXPONENT
+    if n_ice_per_m is not None:
+        n_ratio = _CRYSTAL_N_REF / np.asarray(n_ice_per_m, dtype=float)
+        r = r * np.clip(n_ratio, *_CRYSTAL_N_RATIO_CLIP) ** (1.0 / 3.0)
     return r
 
 

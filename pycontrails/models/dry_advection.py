@@ -338,7 +338,8 @@ class DryAdvection(models.Model):
         columns = ["longitude", "latitude", "level", "time", "age", "waypoint"]
         if "flight_id" in self.source:
             columns.append("flight_id")
-        for key in ("downwash_dz_max", "downwash_tmax", "downwash_p"):  # wake-vortex downwash
+        # wake-vortex downwash params + optional formation ice number for the sedimentation
+        for key in ("downwash_dz_max", "downwash_tmax", "downwash_p", "n_ice_per_m"):
             if key in self.source:
                 columns.append(key)
 
@@ -785,7 +786,10 @@ def _evolve_one_step(
             rhi = thermo.rhi(
                 vector["specific_humidity"], vector["air_temperature"], vector["air_pressure"]
             )
-            r_ice = contrail_properties.emulated_crystal_radius(age_s, rhi=rhi)
+            # n_ice (from the formation model) makes soot-onset contrails fall faster.
+            r_ice = contrail_properties.emulated_crystal_radius(
+                age_s, rhi=rhi, n_ice_per_m=vector.get("n_ice_per_m")
+            )
             v_sed: npt.NDArray[np.floating] | float = (
                 contrail_properties.ice_particle_terminal_fall_speed(
                     vector["air_pressure"], vector["air_temperature"], r_ice
@@ -842,9 +846,9 @@ def _evolve_one_step(
     if flight_id is not None:
         out["flight_id"] = flight_id
 
-    for key in ("downwash_dz_max", "downwash_tmax", "downwash_p"):
+    for key in ("downwash_dz_max", "downwash_tmax", "downwash_p", "n_ice_per_m"):
         val = vector.get(key)
-        if val is not None:  # carry the per-waypoint downwash params forward
+        if val is not None:  # carry downwash params + formation ice number forward
             out[key] = val
 
     azimuth = vector.get("azimuth")
