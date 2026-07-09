@@ -20,12 +20,12 @@ from pycontrails.physics import geo, units
 
 def interp_colocated(
     mdas: list[MetDataArray],
-    longitude: np.ndarray,
-    latitude: np.ndarray,
-    level: np.ndarray,
-    time: np.ndarray,
+    longitude: npt.NDArray[np.floating],
+    latitude: npt.NDArray[np.floating],
+    level: npt.NDArray[np.floating],
+    time: npt.NDArray[np.datetime64],
     **interp_kwargs: Any,
-) -> list[np.ndarray]:
+) -> list[npt.NDArray[np.floating]]:
     """Interpolate several co-located met variables, searching the grid once.
 
     All ``mdas`` share the met grid and are sampled at the same 4-D point, so the
@@ -39,7 +39,7 @@ def interp_colocated(
     :meth:`MetDataArray.interpolate`).
     """
     share = not interp_kwargs.get("localize", False)
-    out: list[np.ndarray] = []
+    out: list[npt.NDArray[np.floating]] = []
     idx = None
     for mda in mdas:
         if not share:
@@ -130,13 +130,13 @@ def advect_centerline_rk4(
     w_mda = met["lagrangian_tendency_of_air_pressure"]
 
     def rates(
-        lon: np.ndarray,
-        lat: np.ndarray,
-        lev: np.ndarray,
-        u: np.ndarray,
-        v: np.ndarray,
-        w: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        lon: npt.NDArray[np.floating],
+        lat: npt.NDArray[np.floating],
+        lev: npt.NDArray[np.floating],
+        u: npt.NDArray[np.floating],
+        v: npt.NDArray[np.floating],
+        w: npt.NDArray[np.floating],
+    ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], npt.NDArray[np.floating]]:
         altitude = units.pl_to_m(lev)
         r_ew = geo.prime_vertical_radius_of_curvature(lat, altitude)
         r_ns = geo.meridional_radius_of_curvature(lat, altitude)
@@ -147,8 +147,11 @@ def advect_centerline_rk4(
         return dlon, dlat, dlev
 
     def interp(
-        lon: np.ndarray, lat: np.ndarray, lev: np.ndarray, time: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        lon: npt.NDArray[np.floating],
+        lat: npt.NDArray[np.floating],
+        lev: npt.NDArray[np.floating],
+        time: npt.NDArray[np.datetime64],
+    ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], npt.NDArray[np.floating]]:
         # u, v and omega are co-located; share the grid-index search across them.
         u, v, w = interp_colocated([u_mda, v_mda, w_mda], lon, lat, lev, time, **interp_kwargs)
         return u, v, w

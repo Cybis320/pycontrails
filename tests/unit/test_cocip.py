@@ -25,6 +25,7 @@ from pycontrails.models.cocip import (
     CocipParams,
     contrail_properties,
     radiative_heating,
+    soot_ice_nucleation,
 )
 from pycontrails.models.cocip.output_formats import (
     contrail_flight_summary_statistics,
@@ -38,6 +39,7 @@ from pycontrails.models.humidity_scaling import (
     ExponentialBoostHumidityScaling,
     ExponentialBoostLatitudeCorrectionHumidityScaling,
 )
+from pycontrails.physics import thermo
 from tests.unit import get_static_path
 
 
@@ -752,24 +754,71 @@ def test_flight_overrides(fl: Flight, met: MetDataset, rad: MetDataset) -> None:
         cocip.eval(fl3)
 
 
+def test_soot_ice_nucleation_hooks() -> None:
+    """The ISSR-onset hooks: onset where RHi > threshold, ice number from emissions."""
+    air_temperature = np.array([220.0, 220.0])
+    air_pressure = np.array([24000.0, 24000.0])
+    q_sat_ice = thermo.q_sat_ice(air_temperature, air_pressure)
+    # RHi 130% (ice-supersaturated) and 80% (sub-saturated).
+    specific_humidity = np.array([1.3 * q_sat_ice[0], 0.8 * q_sat_ice[1]])
+    nvpm_ei_n = np.array([1e15, 1e15])
+
+    onset = soot_ice_nucleation.soot_issr_onset(
+        specific_humidity, air_temperature, air_pressure, nvpm_ei_n
+    )
+    assert onset[0]  # forms where ice-supersaturated
+    assert not onset[1]  # not where sub-saturated
+
+    # No aerosol to nucleate on -> no onset even when supersaturated.
+    onset_no_soot = soot_ice_nucleation.soot_issr_onset(
+        specific_humidity, air_temperature, air_pressure, np.zeros(2)
+    )
+    assert not onset_no_soot.any()
+
+    n_ice_per_m, iwc = soot_ice_nucleation.deposition_initial_ice(
+        nvpm_ei_n[:1],
+        np.array([0.01]),
+        air_temperature[:1],
+        specific_humidity[:1],
+        air_pressure[:1],
+    )
+    assert n_ice_per_m[0] == pytest.approx(1e15 * 0.01)  # SAC-like emissions number
+    assert iwc[0] > 0.0  # ambient excess vapour over ice saturation
+
+
 def test_soot_ice_nucleation_is_additive_opt_in(
     fl: Flight, met: MetDataset, rad: MetDataset
 ) -> None:
-    """The soot-in-ISSR onset pathway is opt-in and unimplemented.
+    """The ISSR-onset pathway is opt-in and additive to canonical CoCiP.
 
-    With the flag off, ``Cocip`` is canonical (covered by the golden tests). Turning it on
-    routes through the research hooks in :mod:`soot_ice_nucleation`, which raise until the
-    physics is supplied, so the pathway cannot silently produce unvalidated results.
+    With the flag off, ``Cocip`` is canonical (bit-identical, covered by the golden tests) and
+    carries no ``onset_mechanism`` tag. Turning it on may also form contrails in
+    ice-supersaturated air where the SAC fails; every retained waypoint is tagged, and
+    enabling the pathway never removes a contrail (additive).
     """
-    cocip = Cocip(
-        met=met.copy(),
-        rad=rad.copy(),
-        process_emissions=False,
-        soot_ice_nucleation=True,
-        humidity_scaling=ExponentialBoostHumidityScaling(),
-    )
-    with pytest.raises(NotImplementedError, match="soot_issr_onset is a research hook"):
-        cocip.eval(fl)
+
+    def run(soot_ice_nucleation_flag: bool) -> tuple[Flight, int]:
+        cocip = Cocip(
+            met=met.copy(),
+            rad=rad.copy(),
+            process_emissions=False,
+            soot_ice_nucleation=soot_ice_nucleation_flag,
+            humidity_scaling=ExponentialBoostHumidityScaling(),
+        )
+        out = cocip.eval(fl.copy())
+        n_contrail = 0 if cocip.contrail is None else len(cocip.contrail)
+        return out, n_contrail
+
+    off_out, off_n = run(False)
+    on_out, on_n = run(True)
+
+    # Flag off is canonical: no onset tag. Flag on tags every waypoint's onset mechanism.
+    assert "onset_mechanism" not in off_out
+    assert "onset_mechanism" in on_out
+    assert set(np.unique(on_out["onset_mechanism"])) <= {"sac", "soot_issr", "none"}
+
+    # Additive: enabling the ISSR onset never removes a contrail.
+    assert on_n >= off_n
 
 
 def test_flight_overrides_emissions(
